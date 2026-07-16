@@ -55,6 +55,57 @@ def build_provider_config(providers=None):
     return config
 
 
+def is_cpu_only(providers) -> bool:
+    """True if every entry in `providers` resolves to the CPU EP."""
+    if not providers:
+        return False
+    for p in providers:
+        name = p[0] if isinstance(p, tuple) else p
+        if name != "CPUExecutionProvider":
+            return False
+    return True
+
+
+def build_cpu_session_options() -> onnxruntime.SessionOptions:
+    """Tuned SessionOptions for CPU-only inference.
+
+    ONNX Runtime's untuned defaults let a single inference call spread
+    across all cores (intra-op) and also spin up its own inter-op thread
+    pool, which contends with this app's own capture/processing/UI threads
+    in live mode — nothing here was previously tuned for CPU at all (unlike
+    the CUDA/CoreML paths, which already had dedicated tuning). Since live
+    mode runs exactly one model call at a time per frame (never multiple
+    graphs concurrently), pinning intra-op threads to a sane count and
+    disabling the inter-op pool (inter_op_num_threads=1) is the standard
+    ONNX Runtime recommendation for single-stream real-time inference.
+    """
+    threads = getattr(modules.globals, "execution_threads", None)
+    if not threads or threads <= 0:
+        threads = max(1, (os.cpu_count() or 4) - 2)
+
+    so = onnxruntime.SessionOptions()
+    so.intra_op_num_threads = int(threads)
+    so.inter_op_num_threads = 1
+    so.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+    so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    # ORT's idle worker threads busy-wait ("spin") for new work by default,
+    # which is fine when a model has the CPU to itself, but this app always
+    # has other threads competing for the same cores in live mode (camera
+    # capture thread, frame-processing thread, Qt UI thread) — unbounded
+    # spinning steals cycles from those and shows up as UI/capture stutter.
+    # Per ONNX Runtime's own tuning guide, a short time-bounded spin window
+    # with exponential backoff keeps wake-up latency low for the *next*
+    # inference call while giving up the core well before the next frame is
+    # due (frame intervals here are tens of ms; the spin window is 1ms):
+    # https://onnxruntime.ai/docs/performance/tune-performance/threading.html
+    so.add_session_config_entry("session.intra_op.spin_duration_us", "1000")
+    so.add_session_config_entry("session.intra_op.spin_backoff_max", "8")
+    so.add_session_config_entry("session.inter_op.spin_duration_us", "1000")
+    so.add_session_config_entry("session.inter_op.spin_backoff_max", "8")
+    return so
+
+
 def run_inference(session: onnxruntime.InferenceSession,
                   input_name: str,
                   input_tensor: "np.ndarray") -> "np.ndarray":

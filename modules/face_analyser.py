@@ -15,7 +15,10 @@ from pathlib import Path
 FACE_ANALYSER = None
 FACE_ANALYSER_LOCK = threading.Lock()
 
-DET_SIZE = (640, 640)
+# Lower = faster detector inference (scales with pixel count), at some cost
+# to catching small/distant faces. 256 is still comfortable for a single
+# frontal webcam face — the common live-mode case.
+DET_SIZE = (256, 256)
 
 
 def get_face_analyser() -> Any:
@@ -37,7 +40,38 @@ def get_face_analyser() -> Any:
                 )
                 FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE)
                 _optimize_det_model(FACE_ANALYSER, providers)
+                _apply_cpu_thread_tuning(FACE_ANALYSER, providers)
     return FACE_ANALYSER
+
+
+def _apply_cpu_thread_tuning(fa: Any, providers) -> None:
+    """Rebuild every loaded sub-model's session with tuned CPU thread settings.
+
+    insightface's public API (FaceAnalysis/get_model) only ever forwards
+    `providers`/`provider_options` into its InferenceSession construction —
+    a custom SessionOptions has no supported injection point — so the tuned
+    options are applied by replacing `.session` post-construction, same
+    technique `_optimize_det_model` already uses for the CoreML path below.
+    No-ops on GPU providers, which already have their own dedicated tuning.
+    """
+    from modules.processors.frame._onnx_enhancer import (
+        is_cpu_only, build_cpu_session_options,
+    )
+    if not is_cpu_only(providers):
+        return
+
+    import onnxruntime
+    session_options = build_cpu_session_options()
+    for model in fa.models.values():
+        model_path = getattr(model, 'model_file', None)
+        if model_path is None or not os.path.exists(model_path):
+            continue
+        try:
+            model.session = onnxruntime.InferenceSession(
+                model_path, sess_options=session_options, providers=providers,
+            )
+        except Exception as e:
+            print(f"Warning: failed to apply CPU thread tuning to {model_path}: {e}")
 
 
 def _optimize_det_model(fa: Any, providers) -> None:
@@ -90,10 +124,14 @@ def _optimize_det_model(fa: Any, providers) -> None:
 def _needs_landmark() -> bool:
     """Check whether any active feature requires 106-point landmarks.
 
-    Landmarks are needed by face enhancers and mouth masking, but not
-    by the face swapper alone.
+    Landmarks are needed by face enhancers, mouth masking, eyes masking,
+    and beard/jaw masking, but not by the face swapper alone.
     """
     if getattr(modules.globals, "mouth_mask", False):
+        return True
+    if getattr(modules.globals, "eyes_mask", False):
+        return True
+    if getattr(modules.globals, "beard_mask", False):
         return True
     processors = getattr(modules.globals, "frame_processors", [])
     return any(p in processors for p in

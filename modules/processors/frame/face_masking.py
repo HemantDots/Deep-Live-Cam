@@ -150,7 +150,11 @@ def create_lower_mouth_mask(
 def create_eyes_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
     eyes_cutout = None
-    landmarks = face.landmark_2d_106
+    # Defaults so the return at the bottom never raises UnboundLocalError
+    # when landmarks are missing (nothing below the `if` executes in that case).
+    min_x = min_y = max_x = max_y = 0
+    eyes_polygon = None
+    landmarks = getattr(face, "landmark_2d_106", None)
     if landmarks is not None:
         # Left eye landmarks (87-96) and right eye landmarks (33-42)
         left_eye = landmarks[87:96]

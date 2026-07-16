@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import platform
 import queue
+import shutil
 import sys
 import tempfile
 import threading
@@ -22,6 +23,7 @@ from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import onnxruntime
 import requests
 from PIL import Image, ImageOps
 from PySide6.QtCore import (
@@ -68,6 +70,7 @@ from modules.face_analyser import (
 from modules.gettext import LanguageManager
 from modules.gpu_processing import gpu_cvt_color, gpu_flip, gpu_resize
 from modules.processors.frame.core import get_frame_processors_modules
+from modules.recorder import LiveRecorder
 from modules.utilities import (
     has_image_extension,
     is_image,
@@ -84,13 +87,24 @@ import json
 
 # ─── constants ────────────────────────────────────────────────────────────
 
-ROOT_HEIGHT = 820
+ROOT_HEIGHT = 900
 ROOT_WIDTH = 640
 
 PREVIEW_MAX_HEIGHT = 700
 PREVIEW_MAX_WIDTH = 1200
 PREVIEW_DEFAULT_WIDTH = 640
 PREVIEW_DEFAULT_HEIGHT = 360
+
+# Live-mode capture resolution presets: (label, width, height). Lower
+# resolutions cut detection/swap cost roughly with pixel count on CPU.
+# NOTE: labels are translated at point-of-use (_build_camera_card), not
+# here — this module-level constant is built before _() is defined below.
+LIVE_RESOLUTION_PRESETS = [
+    ("320x240 (Fastest)", 320, 240),
+    ("480x270 (Fast)", 480, 270),
+    ("640x360 (Balanced)", 640, 360),
+    ("960x540 (Quality)", 960, 540),
+]
 
 POPUP_WIDTH = 750
 POPUP_HEIGHT = 810
@@ -111,6 +125,7 @@ SOURCE_TARGET_PREVIEW_SIZE = 200
 QSS = """
 QMainWindow, QDialog { background-color: #1e1e1e; color: #e6e6e6; }
 QWidget { color: #e6e6e6; font-family: "Segoe UI", "SF Pro Display", "Helvetica Neue", Arial, sans-serif; font-size: 11pt; }
+QWidget#webcamPreview { background-color: #1e1e1e; }
 
 QGroupBox {
     background-color: #262626;
@@ -144,6 +159,14 @@ QPushButton#secondary {
 QPushButton#secondary:hover { background-color: #4a4a4a; }
 QPushButton#danger { background-color: #c2412d; }
 QPushButton#danger:hover  { background-color: #d8523c; }
+QPushButton#recordButton {
+    background-color: transparent;
+    color: #ff5a3c;
+    border: 2px solid #c2412d;
+}
+QPushButton#recordButton:hover { background-color: rgba(194, 65, 45, 0.15); }
+QPushButton#recordButton:pressed { background-color: rgba(194, 65, 45, 0.3); }
+QPushButton#recordButton:disabled { color: #888; border-color: #555; }
 
 QComboBox {
     background-color: #2a2a2a;
@@ -314,6 +337,10 @@ def save_switch_states():
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
         "mouth_mask_size": modules.globals.mouth_mask_size,
+        "eyes_mask": modules.globals.eyes_mask,
+        "beard_mask": modules.globals.beard_mask,
+        "skin_tone_match": modules.globals.skin_tone_match,
+        "clahe_match": modules.globals.clahe_match,
     }
     try:
         with open("switch_states.json", "w") as f:
@@ -343,6 +370,10 @@ def load_switch_states():
         modules.globals.mouth_mask_size = 0.0
         modules.globals.mouth_mask = False
         modules.globals.show_mouth_mask_box = False
+        modules.globals.eyes_mask = state.get("eyes_mask", False)
+        modules.globals.beard_mask = state.get("beard_mask", False)
+        modules.globals.skin_tone_match = state.get("skin_tone_match", False)
+        modules.globals.clahe_match = state.get("clahe_match", False)
     except FileNotFoundError:
         pass
     except (OSError, json.JSONDecodeError):
@@ -425,6 +456,40 @@ def get_available_cameras() -> Tuple[List[int], List[str]]:
     return (indices, names) if names else ([], ["No cameras found"])
 
 
+# ─── execution provider selection ───────────────────────────────────────
+# Small local mirror of core.py's encode/decode_execution_providers.
+# modules.core imports modules.ui at its own top level, so ui.py cannot do
+# a top-level `import modules.core` (would raise trying to read attributes
+# core.py hasn't defined yet, since ui.py finishes importing mid-way through
+# core.py's own import). Duplicating these 2-line pure functions here avoids
+# that entirely rather than working around it with a deferred import.
+
+
+def _encode_provider(name: str) -> str:
+    return name.replace("ExecutionProvider", "").lower()
+
+
+def get_available_providers() -> List[str]:
+    """Short names (e.g. 'cpu', 'cuda') for whatever ONNX Runtime reports
+    as available on this machine — grows automatically if CUDA/CoreML/
+    DirectML wheels are installed later, no code change needed here."""
+    return [_encode_provider(p) for p in onnxruntime.get_available_providers()]
+
+
+def decode_provider(short_name: str) -> List[str]:
+    return [
+        p for p in onnxruntime.get_available_providers()
+        if _encode_provider(p) == short_name
+    ]
+
+
+def current_provider_choice() -> str:
+    providers = getattr(modules.globals, "execution_providers", None)
+    if providers:
+        return _encode_provider(providers[0])
+    return "cpu"
+
+
 # ─── main window ─────────────────────────────────────────────────────────
 
 
@@ -471,11 +536,19 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(
             f"{modules.metadata.name} {modules.metadata.version} {modules.metadata.edition}"
         )
-        self.setMinimumSize(ROOT_WIDTH, ROOT_HEIGHT)
+        self.setMinimumSize(ROOT_WIDTH, 480)
         self.resize(ROOT_WIDTH, ROOT_HEIGHT)
 
+        # Scrollable content: the Options/Refinement cards keep growing as
+        # features get added, and a fixed-height window with no scroll area
+        # silently compresses/overlaps rows once content no longer fits
+        # (rather than erroring), so this is the structural fix rather than
+        # just widening the window for the current control count.
         root = QWidget()
-        self.setCentralWidget(root)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -594,6 +667,14 @@ class MainWindow(QMainWindow):
                                  "Fix blue/green color cast from some webcams")
         self.sw_show_fps = make("show_fps", "Show FPS",
                                 "Display frames-per-second counter on the live preview")
+        self.sw_eyes_mask = make("eyes_mask", "Eyes Mask",
+                                 "Keep your real eyes instead of the swapped ones")
+        self.sw_beard_mask = make("beard_mask", "Beard/Jaw Mask",
+                                  "Keep your real beard and jawline instead of the swapped one")
+        self.sw_skin_tone = make("skin_tone_match", "Skin Tone Match",
+                                 "Color-match the swapped face to your actual skin tone/lighting")
+        self.sw_clahe = make("clahe_match", "Local Contrast Match",
+                             "Locally adjust the swapped face's contrast to better match lighting")
 
         # Map faces is special — closes mapper when toggled off.
         self.sw_map_faces = _Switch(_("Map faces"), modules.globals.map_faces,
@@ -606,6 +687,8 @@ class MainWindow(QMainWindow):
             self.sw_keep_frames, self.sw_many_faces,
             self.sw_map_faces, self.sw_show_fps,
             self.sw_poisson, self.sw_color_fix,
+            self.sw_eyes_mask, self.sw_beard_mask,
+            self.sw_skin_tone, self.sw_clahe,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)
@@ -669,6 +752,22 @@ class MainWindow(QMainWindow):
             _("0 = use swapped mouth, 100 = expose original mouth to chin area")
         )
         grid.addWidget(self.s_mouth, 2, 1)
+
+        # Temporal smoothing — always starts at 0 (off) on launch
+        grid.addWidget(QLabel(_("Temporal Smoothing")), 3, 0)
+        self.s_smoothing = slider(0.0, 100.0, 0.0, 1, self._on_smoothing_change)
+        self.s_smoothing.setToolTip(
+            _("Blend each frame with the previous one to reduce flicker (0 = off)")
+        )
+        grid.addWidget(self.s_smoothing, 3, 1)
+
+        # Edge feather — softness of the swap boundary
+        grid.addWidget(QLabel(_("Edge Feather")), 4, 0)
+        self.s_feather = slider(1.0, 40.0, 12.0, 1, self._on_feather_change)
+        self.s_feather.setToolTip(
+            _("How soft the blend edge is between the swapped face and the original frame")
+        )
+        grid.addWidget(self.s_feather, 4, 1)
         return card
 
     # ── action row ───────────────────────────────────────────────────────
@@ -698,9 +797,10 @@ class MainWindow(QMainWindow):
 
     def _build_camera_card(self) -> QGroupBox:
         card = QGroupBox(_("Camera"))
-        layout = QHBoxLayout(card)
+        outer = QVBoxLayout(card)
 
-        layout.addWidget(QLabel(_("Select Camera:")))
+        cam_row = QHBoxLayout()
+        cam_row.addWidget(QLabel(_("Select Camera:")))
         self._camera_indices, self._camera_names = get_available_cameras()
 
         self.cb_camera = QComboBox()
@@ -712,13 +812,50 @@ class MainWindow(QMainWindow):
             self.cb_camera.addItems(self._camera_names)
             cam_ok = True
         self.cb_camera.setToolTip(_("Select which camera to use for live mode"))
-        layout.addWidget(self.cb_camera, 1)
+        cam_row.addWidget(self.cb_camera, 1)
 
         self.btn_live = QPushButton(_("Live"))
         self.btn_live.setEnabled(cam_ok)
         self.btn_live.setToolTip(_("Start real-time face swap using webcam"))
         self.btn_live.clicked.connect(self._on_live)
-        layout.addWidget(self.btn_live)
+        cam_row.addWidget(self.btn_live)
+        outer.addLayout(cam_row)
+
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(QLabel(_("Execution Provider:")))
+        self.cb_provider = QComboBox()
+        choices = get_available_providers() or ["cpu"]
+        self.cb_provider.addItems(choices)
+        current = current_provider_choice()
+        if current in choices:
+            self.cb_provider.setCurrentText(current)
+        self.cb_provider.setToolTip(
+            _("Hardware backend for face detection/swap/enhancement. "
+              "Only shows what's actually available on this machine — "
+              "install CUDA/CoreML/DirectML support to see more options here.")
+        )
+        self.cb_provider.currentTextChanged.connect(self._on_provider_change)
+        provider_row.addWidget(self.cb_provider, 1)
+        outer.addLayout(provider_row)
+
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel(_("Live Resolution:")))
+        self.cb_resolution = QComboBox()
+        for label, w, h in LIVE_RESOLUTION_PRESETS:
+            self.cb_resolution.addItem(_(label), (w, h))
+        current_res = (modules.globals.live_capture_width, modules.globals.live_capture_height)
+        for i in range(self.cb_resolution.count()):
+            if self.cb_resolution.itemData(i) == current_res:
+                self.cb_resolution.setCurrentIndex(i)
+                break
+        self.cb_resolution.setToolTip(
+            _("Camera capture resolution for Live mode. Lower = faster "
+              "detection/swap on CPU, at the cost of preview sharpness. "
+              "Applies next time you click Live.")
+        )
+        self.cb_resolution.currentIndexChanged.connect(self._on_resolution_change)
+        res_row.addWidget(self.cb_resolution, 1)
+        outer.addLayout(res_row)
 
         return card
 
@@ -726,6 +863,46 @@ class MainWindow(QMainWindow):
 
     def set_status(self, text: str) -> None:
         self._status_label.setText(text)
+
+    def _on_provider_change(self, choice: str) -> None:
+        decoded = decode_provider(choice)
+        if not decoded:
+            update_status(f"Execution provider '{choice}' is not available on this machine.")
+            return
+        modules.globals.execution_providers = decoded
+
+        # Every cached session below is a lazy module-level singleton keyed
+        # on nothing but "has one already been built" — nulling them forces
+        # a fresh session against the new provider on next use, without
+        # needing an app restart. Using importlib rather than `import
+        # modules.x` here deliberately: the latter binds a local name
+        # `modules` that shadows this file's top-level `modules` package
+        # import for the rest of the function, breaking the
+        # `modules.globals...` line above (UnboundLocalError).
+        import importlib
+        for mod_name, attr in (
+            ("modules.face_analyser", "FACE_ANALYSER"),
+            ("modules.processors.frame.face_swapper", "FACE_SWAPPER"),
+            ("modules.processors.frame.face_enhancer", "FACE_ENHANCER"),
+            ("modules.processors.frame.face_enhancer_gpen256", "ENHANCER"),
+            ("modules.processors.frame.face_enhancer_gpen512", "ENHANCER"),
+        ):
+            try:
+                mod = importlib.import_module(mod_name)
+                setattr(mod, attr, None)
+            except Exception:
+                pass
+
+        update_status(
+            f"Execution provider set to '{choice}' — applies next time a "
+            "model loads (next Live click or Start)."
+        )
+
+    def _on_resolution_change(self, index: int) -> None:
+        w, h = self.cb_resolution.itemData(index)
+        modules.globals.live_capture_width = w
+        modules.globals.live_capture_height = h
+        update_status(f"Live resolution set to {w}x{h} — applies next time you click Live.")
 
     def _on_select_source(self) -> None:
         global _RECENT_SOURCE_DIR
@@ -860,6 +1037,19 @@ class MainWindow(QMainWindow):
 
     def _on_mouth_mask_released(self) -> None:
         modules.globals.show_mouth_mask_box = False
+
+    def _on_smoothing_change(self, value: float) -> None:
+        # value: 0-100 slider -> interpolation_weight (lower weight = smoother,
+        # per apply_post_processing's blend-with-previous-frame logic).
+        # 0 disables entirely: weight=1.0 fails that function's `< 1` guard.
+        if value <= 0:
+            modules.globals.interpolation_weight = 1.0
+        else:
+            modules.globals.interpolation_weight = 1.0 - (value / 100.0) * 0.9
+        modules.globals.enable_interpolation = True
+
+    def _on_feather_change(self, value: float) -> None:
+        modules.globals.edge_feather = value
 
     def _on_start(self) -> None:
         if _MAPPER is not None and _MAPPER.isVisible():
@@ -1042,6 +1232,10 @@ class _ProcessingWorker(QThread):
         self._pq = processed_queue
         self._stop = stop_event
         self._fps = camera_fps
+        # Set/cleared by WebcamPreviewWindow's Record button. Written here
+        # (background thread) rather than from _tick (Qt UI thread) so a
+        # slow/stalled encoder pipe can never block the UI event loop.
+        self.recorder = None
 
     def run(self) -> None:
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
@@ -1089,10 +1283,15 @@ class _ProcessingWorker(QThread):
                 elif cached_target_face is not None:
                     cached_faces = [cached_target_face]
 
-                # Fast detection skips the 2d106 landmark model, but the mouth
-                # mask needs it. Attach landmarks on demand (computed once per
-                # detection cycle — the helper no-ops if already present).
-                if modules.globals.mouth_mask and cached_faces:
+                # Fast detection skips the 2d106 landmark model, but mouth/
+                # eyes/beard masking need it. Attach landmarks on demand
+                # (computed once per detection cycle — the helper no-ops if
+                # already present).
+                if (
+                    modules.globals.mouth_mask
+                    or modules.globals.eyes_mask
+                    or modules.globals.beard_mask
+                ) and cached_faces:
                     ensure_landmarks(temp_frame, cached_faces)
 
                 for fp in frame_processors:
@@ -1158,6 +1357,10 @@ class _ProcessingWorker(QThread):
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
                 )
 
+            recorder = self.recorder
+            if recorder is not None:
+                recorder.write_frame(temp_frame)
+
             try:
                 self._pq.put_nowait(temp_frame)
             except queue.Full:
@@ -1171,9 +1374,25 @@ class _ProcessingWorker(QThread):
                     pass
 
 
+class _StopRecordingWorker(QThread):
+    """Runs LiveRecorder.stop() (which can block up to ~10s waiting on
+    ffmpeg) off the Qt UI thread, then reports the result back via signal."""
+
+    finished_with_path = Signal(object)  # str path, or None on failure
+
+    def __init__(self, recorder: LiveRecorder):
+        super().__init__()
+        self._recorder = recorder
+
+    def run(self) -> None:
+        path = self._recorder.stop()
+        self.finished_with_path.emit(path)
+
+
 class WebcamPreviewWindow(QWidget):
     def __init__(self, camera_index: int):
         super().__init__()
+        self.setObjectName("webcamPreview")
         self.setWindowTitle("Live Preview")
         self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
         layout = QVBoxLayout(self)
@@ -1183,11 +1402,34 @@ class WebcamPreviewWindow(QWidget):
         self._image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self._image_label, 1)
 
+        record_row = QHBoxLayout()
+        record_row.setContentsMargins(8, 4, 8, 4)
+        self.btn_record = QPushButton(_("● Start Recording"))
+        self.btn_record.setObjectName("recordButton")
+        self.btn_record.setToolTip(
+            _("Record the live face-swapped feed plus microphone audio to a video file")
+        )
+        self.btn_record.clicked.connect(self._on_record_toggle)
+        record_row.addWidget(self.btn_record)
+        self._record_label = QLabel("")
+        record_row.addWidget(self._record_label)
+        record_row.addStretch(1)
+        layout.addLayout(record_row)
+
+        self._recorder: Optional[LiveRecorder] = None
+        self._record_timer: Optional[QTimer] = None
+        self._record_start_time: float = 0.0
+        self._stopper: Optional[_StopRecordingWorker] = None
+
         self._cap = VideoCapturer(camera_index)
-        if not self._cap.start(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, 60):
+        capture_width = modules.globals.live_capture_width or PREVIEW_DEFAULT_WIDTH
+        capture_height = modules.globals.live_capture_height or PREVIEW_DEFAULT_HEIGHT
+        if not self._cap.start(capture_width, capture_height, 60):
             update_status("Failed to start camera")
             QTimer.singleShot(0, self.close)
             return
+
+        modules.globals.webcam_preview_running = True
 
         camera_fps = self._cap.actual_fps
         print(
@@ -1225,12 +1467,113 @@ class WebcamPreviewWindow(QWidget):
         bgr_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
         self._image_label.setPixmap(_bgr_to_qpixmap(bgr_frame))
 
+    # ── recording ────────────────────────────────────────────────────────
+
+    def _on_record_toggle(self) -> None:
+        if self._recorder is None:
+            self._recorder = LiveRecorder(
+                width=self._cap.actual_width,
+                height=self._cap.actual_height,
+                fps=self._cap.actual_fps,
+            )
+            if not self._recorder.start():
+                update_status("Failed to start recording (ffmpeg error) — see console log.")
+                self._recorder = None
+                return
+
+            self._processing_worker.recorder = self._recorder
+            self._record_start_time = time.time()
+            self.btn_record.setText(_("■ Stop Recording"))
+            if self._recorder.audio_enabled:
+                update_status("Recording started (with microphone audio).")
+            else:
+                update_status(
+                    "Recording started — microphone audio unavailable, recording video only."
+                )
+            self._record_timer = QTimer(self)
+            self._record_timer.timeout.connect(self._update_record_label)
+            self._record_timer.start(500)
+            self._update_record_label()
+        else:
+            # Stop writes immediately; finalize the file off the UI thread
+            # since ffmpeg can take a moment to flush/mux on stop().
+            self._processing_worker.recorder = None
+            recorder = self._recorder
+            self._recorder = None
+            if self._record_timer is not None:
+                self._record_timer.stop()
+                self._record_timer = None
+            self._record_label.setText(_("Finishing recording…"))
+            self.btn_record.setEnabled(False)
+
+            self._stopper = _StopRecordingWorker(recorder)
+            self._stopper.finished_with_path.connect(self._on_recording_stopped)
+            self._stopper.start()
+
+    def _update_record_label(self) -> None:
+        elapsed = int(time.time() - self._record_start_time)
+        mins, secs = divmod(elapsed, 60)
+        self._record_label.setText(f"● REC {mins:02d}:{secs:02d}")
+
+    def _on_recording_stopped(self, path: object) -> None:
+        self.btn_record.setEnabled(True)
+        self.btn_record.setText(_("● Start Recording"))
+        self._record_label.setText("")
+
+        if not path:
+            update_status("Recording failed or produced no usable output.")
+            return
+
+        default_name = f"recording_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+        dest, _f = QFileDialog.getSaveFileName(
+            self, _("Save recording"), default_name, "Videos (*.mp4)"
+        )
+        if dest:
+            try:
+                shutil.move(path, dest)
+                update_status(f"Recording saved to {dest}")
+            except Exception as e:
+                update_status(
+                    f"Failed to move recording to {dest}: {e}. "
+                    f"It's still available at {path}"
+                )
+        else:
+            update_status(f"Save canceled — recording kept at {path}")
+
     def closeEvent(self, event) -> None:
         self._stop_event.set()
+        modules.globals.webcam_preview_running = False
         try:
             self._timer.stop()
         except Exception:
             pass
+        # Finalize any in-progress recording synchronously — the window is
+        # closing anyway, so a brief block here (ffmpeg flush/mux) is fine
+        # and avoids racing the async stop-worker against window teardown.
+        if self._recorder is not None:
+            self._processing_worker.recorder = None
+            if self._record_timer is not None:
+                self._record_timer.stop()
+            recorder, self._recorder = self._recorder, None
+            path = recorder.stop()
+            if path:
+                default_name = f"recording_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+                dest, _f = QFileDialog.getSaveFileName(
+                    self, _("Save recording"), default_name, "Videos (*.mp4)"
+                )
+                if dest:
+                    try:
+                        shutil.move(path, dest)
+                        update_status(f"Recording saved to {dest}")
+                    except Exception as e:
+                        update_status(
+                            f"Failed to move recording to {dest}: {e}. "
+                            f"It's still available at {path}"
+                        )
+                else:
+                    update_status(f"Save canceled — recording kept at {path}")
+            else:
+                update_status("Recording failed or produced no usable output.")
         for worker in (self._capture_worker, self._processing_worker):
             try:
                 worker.wait(2000)

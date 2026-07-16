@@ -18,6 +18,8 @@ from modules.utilities import (
 )
 from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
+from modules.processors.frame.face_masking import create_eyes_mask
+from insightface.utils import face_align
 import os
 from collections import deque
 import time
@@ -29,6 +31,16 @@ NAME = "DLC.FACE-SWAPPER"
 # --- START: Added for Interpolation ---
 PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previous step
 # --- END: Added for Interpolation ---
+
+# Live-mode swap cache: reuses the last generated face texture (bgr_fake)
+# for one skipped frame instead of re-running the swap model's expensive
+# GAN forward pass every single frame. The (cheap) alignment is still
+# recomputed fresh every frame via face_align.norm_crop2 — only the
+# neural-net inference is skipped — so the pasted position always tracks
+# the current frame even though the face's pixel content lags by up to
+# one frame. Gated to live mode + single-face only (see swap_face()).
+_SWAP_LIVE_CACHE = {'bgr_fake': None, 'frame_count': 0}
+_SWAP_SKIP_INTERVAL = 2  # run the real GAN inference every N frames
 
 # --- Poisson blend (ported from deep-live-cam-gumroad-edition) ---
 # Root-cause fix for the "wobble": the blend mask is NOT built from the
@@ -283,12 +295,36 @@ def get_face_swapper() -> Any:
                     for p in providers_config
                 ):
                     _init_cuda_graph_session(model_path, FACE_SWAPPER)
+                _apply_cpu_thread_tuning(FACE_SWAPPER, model_path, providers_config)
                 update_status("Face swapper model loaded successfully.", NAME)
             except Exception as e:
                 update_status(f"Error loading face swapper model: {e}", NAME)
                 FACE_SWAPPER = None
                 return None
     return FACE_SWAPPER
+
+
+def _apply_cpu_thread_tuning(swapper: Any, model_path: str, providers) -> None:
+    """Rebuild the swapper's session with tuned CPU thread settings.
+
+    Same rationale and technique as face_analyser._apply_cpu_thread_tuning:
+    insightface's get_model() has no supported way to pass a custom
+    SessionOptions, so it's applied by replacing `.session` post-construction.
+    No-ops on GPU providers (CUDA/CoreML already have their own tuning above).
+    """
+    from modules.processors.frame._onnx_enhancer import (
+        is_cpu_only, build_cpu_session_options,
+    )
+    if swapper is None or not is_cpu_only(providers):
+        return
+
+    import onnxruntime
+    try:
+        swapper.session = onnxruntime.InferenceSession(
+            model_path, sess_options=build_cpu_session_options(), providers=providers,
+        )
+    except Exception as e:
+        print(f"Warning: failed to apply CPU thread tuning to swapper: {e}")
 
 
 _HAS_TORCH_CUDA = False
@@ -303,6 +339,7 @@ except ImportError:
 _paste_cache = {
     'soft_alpha': None,  # feathered alpha mask in aligned-face space
     'alpha_size': 0,
+    'feather': None,
 }
 
 
@@ -316,7 +353,15 @@ def _get_soft_alpha(size: int) -> np.ndarray:
     per-frame gives a visually equivalent feather at O(crop_area) cost —
     the feather radius scales naturally with the affine transform.
     """
-    if _paste_cache['alpha_size'] != size:
+    # Sigma is user-tunable via the Edge Feather slider (globals.edge_feather).
+    # Clamped defensively since it drives a GaussianBlur sigma argument.
+    feather = getattr(modules.globals, "edge_feather", 12.0)
+    try:
+        feather = max(1.0, min(50.0, float(feather)))
+    except (TypeError, ValueError):
+        feather = 12.0
+
+    if _paste_cache['alpha_size'] != size or _paste_cache['feather'] != feather:
         # Elliptical (not square) template — matches the gumroad edition's
         # _create_elliptical_mask. A full/eroded square leaves the aligned
         # crop's corners near-opaque, so the swapped square's straight edges
@@ -326,9 +371,31 @@ def _get_soft_alpha(size: int) -> np.ndarray:
         axes = (int(size * 0.44), int(size * 0.44))
         mask = np.zeros((size, size), dtype=np.uint8)
         cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
-        mask = cv2.GaussianBlur(mask, (31, 31), 12)
+        mask = cv2.GaussianBlur(mask, (31, 31), feather)
+
+        # Force a true fade-to-zero at the crop's own boundary. Measured
+        # directly: the circle radius (0.44*size) leaves only ~8px of margin
+        # to the edge of a 128px crop, which isn't enough room for the blur
+        # above to fully decay — it left ~40% residual alpha bleeding all the
+        # way to the boundary regardless of the feather value (verified this
+        # barely changes with feather at all, since the margin, not the blur
+        # radius, is the bottleneck). _fast_paste_back warps this mask onto
+        # the frame and treats everything outside the warped square as hard
+        # zero, so that residual alpha created a faint but real hard-edged
+        # rectangle at the swap's boundary. This multiplicative ramp forces
+        # the outermost few pixels to zero without touching the actual face
+        # area (verified: center/near-face values are unchanged).
+        border = max(3, size // 24)
+        ramp = np.ones(size, dtype=np.float32)
+        lin = np.linspace(0, 1, border, dtype=np.float32)
+        ramp[:border] = lin
+        ramp[-border:] = lin[::-1]
+        vignette = ramp[:, None] * ramp[None, :]
+        mask = (mask.astype(np.float32) * vignette).astype(np.uint8)
+
         _paste_cache['soft_alpha'] = mask  # uint8 [0, 255] — blended via cv2 SIMD ops
         _paste_cache['alpha_size'] = size
+        _paste_cache['feather'] = feather
     return _paste_cache['soft_alpha']
 
 # CUDA graph swap session cache
@@ -436,6 +503,30 @@ def _cuda_graph_swap_inference(blob: np.ndarray, latent: np.ndarray) -> np.ndarr
         return cg['io_binding'].get_outputs()[0].numpy()
 
 
+# Cached CLAHE instance for the "Local Contrast Match" refinement — cheap to
+# reuse, and cv2.CLAHE.apply() is not guaranteed thread-safe for concurrent
+# calls, so the disk-based multi_process_frame thread pool must serialize on it.
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+_CLAHE_LOCK = threading.Lock()
+
+
+def _apply_clahe_bgr(bgr_crop: np.ndarray) -> np.ndarray:
+    """Locally equalizes contrast on the L channel (LAB space) of a BGR crop.
+
+    Helps the swapped face's local contrast/lighting blend in with the
+    surrounding frame instead of looking flat or mismatched.
+    """
+    try:
+        lab = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        with _CLAHE_LOCK:
+            l = _CLAHE.apply(l)
+        lab = cv2.merge((l, a, b))
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    except cv2.error:
+        return bgr_crop
+
+
 def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, M: np.ndarray) -> Frame:
     """Paste bgr_fake back onto target_img via the inverse affine of M.
 
@@ -480,6 +571,14 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
 
     target_crop = target_img[y1p:y2p, x1p:x2p]
 
+    # --- Skin Tone Match / Local Contrast Match ---
+    # Both operate on the small aligned-crop region only (not the full frame),
+    # so the extra cost is proportional to face size, not frame size.
+    if getattr(modules.globals, "skin_tone_match", False):
+        bgr_fake_crop = apply_color_transfer(bgr_fake_crop, target_crop)
+    if getattr(modules.globals, "clahe_match", False):
+        bgr_fake_crop = _apply_clahe_bgr(bgr_fake_crop)
+
     if _HAS_TORCH_CUDA:
         # Scale alpha to [0, 1] on device — cheaper to upload uint8 than float.
         mask_t = torch.from_numpy(alpha_crop).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
@@ -517,12 +616,17 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     opacity = getattr(modules.globals, "opacity", 1.0)
     opacity = max(0.0, min(1.0, opacity))
     mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
+    eyes_mask_enabled = getattr(modules.globals, "eyes_mask", False)
+    beard_mask_enabled = getattr(modules.globals, "beard_mask", False)
     poisson_blend_enabled = getattr(modules.globals, "poisson_blend", False)
     # Poisson blend's seamlessClone needs the genuine pre-swap frame as its
     # destination. Without this, original_frame aliases temp_frame, which
     # _fast_paste_back mutates in place — so seamlessClone would blend the
     # swapped face onto the already-swapped frame (no visible effect).
-    needs_original = opacity < 1.0 or mouth_mask_enabled or poisson_blend_enabled
+    needs_original = (
+        opacity < 1.0 or mouth_mask_enabled or eyes_mask_enabled
+        or beard_mask_enabled or poisson_blend_enabled
+    )
     if needs_original:
         original_frame = temp_frame.copy()
     else:
@@ -531,26 +635,54 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
 
+    # Only skip-and-reuse in live mode with a single tracked face — many_faces
+    # would paste one cached identity's texture onto every detected face, and
+    # file/video processing should always use full quality since it isn't
+    # racing a real-time deadline.
+    live_mode = getattr(modules.globals, "webcam_preview_running", False)
+    many_faces_mode = getattr(modules.globals, "many_faces", False)
+    use_swap_cache = live_mode and not many_faces_mode
+
+    run_inference = True
+    if use_swap_cache:
+        _SWAP_LIVE_CACHE['frame_count'] += 1
+        run_inference = (
+            _SWAP_LIVE_CACHE['frame_count'] % _SWAP_SKIP_INTERVAL == 0
+            or _SWAP_LIVE_CACHE['bgr_fake'] is None
+        )
+
     try:
         if not temp_frame.flags['C_CONTIGUOUS']:
             temp_frame = np.ascontiguousarray(temp_frame)
 
-        # Use paste_back=False and our optimized paste-back
-        if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
-            with modules.globals.dml_lock:
+        if run_inference:
+            # Use paste_back=False and our optimized paste-back
+            if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
+                with modules.globals.dml_lock:
+                    bgr_fake, M = face_swapper.get(
+                        temp_frame, target_face, source_face, paste_back=False
+                    )
+            else:
                 bgr_fake, M = face_swapper.get(
                     temp_frame, target_face, source_face, paste_back=False
                 )
+
+            if bgr_fake is None:
+                return original_frame
+
+            if not isinstance(bgr_fake, np.ndarray):
+                return original_frame
+
+            if use_swap_cache:
+                _SWAP_LIVE_CACHE['bgr_fake'] = bgr_fake
         else:
-            bgr_fake, M = face_swapper.get(
-                temp_frame, target_face, source_face, paste_back=False
+            # Reuse the last generated face texture; only the (cheap)
+            # alignment is recomputed so the paste position still tracks
+            # this frame's actual face position/pose.
+            bgr_fake = _SWAP_LIVE_CACHE['bgr_fake']
+            _, M = face_align.norm_crop2(
+                temp_frame, target_face.kps, face_swapper.input_size[0]
             )
-
-        if bgr_fake is None:
-            return original_frame
-
-        if not isinstance(bgr_fake, np.ndarray):
-            return original_frame
 
         # Pass a dummy aimg with correct shape — _fast_paste_back only uses aimg.shape
         # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
@@ -566,10 +698,13 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # --- Post-swap Processing (Masking, Opacity, etc.) ---
     # Now, work with the guaranteed uint8 'swapped_frame'
 
-    if mouth_mask_enabled: # Check if mouth_mask is enabled
-        # Create a mask for the target face
+    # Whole-face mask shared by mouth/eyes/beard masking below — computed at
+    # most once per frame regardless of how many of the three are active.
+    face_mask = None
+    if mouth_mask_enabled or eyes_mask_enabled or beard_mask_enabled:
         face_mask = create_face_mask(target_face, original_frame) # Use original_frame for mask creation geometry
 
+    if mouth_mask_enabled: # Check if mouth_mask is enabled
         # Create the mouth mask using the ORIGINAL frame (before swap) for cutout
         mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = (
             create_lower_mouth_mask(target_face, original_frame) # Use original_frame for real mouth cutout
@@ -588,7 +723,26 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                 swapped_frame = draw_mouth_mask_visualization(
                     swapped_frame, target_face, mouth_mask_data
                 )
-        
+
+    if eyes_mask_enabled:
+        # Keep the target's real eyes instead of the swapped ones, same
+        # paste-back pattern as the mouth mask above.
+        _, eyes_cutout, eyes_box, eyes_polygon = create_eyes_mask(target_face, original_frame)
+        if (eyes_cutout is not None and eyes_box != (0, 0, 0, 0)
+                and eyes_polygon is not None and len(eyes_polygon) >= 3):
+            swapped_frame = apply_mouth_area(
+                swapped_frame, eyes_cutout, eyes_box, face_mask, eyes_polygon
+            )
+
+    if beard_mask_enabled:
+        # Keep the target's real beard/jawline instead of the swapped one.
+        _, beard_cutout, beard_box, beard_polygon = create_beard_mask(target_face, original_frame)
+        if (beard_cutout is not None and beard_box != (0, 0, 0, 0)
+                and beard_polygon is not None and len(beard_polygon) >= 3):
+            swapped_frame = apply_mouth_area(
+                swapped_frame, beard_cutout, beard_box, face_mask, beard_polygon
+            )
+
     # --- Poisson Blending ---
     # Mask derived from the swap's own affine (M) + swapped pixels (bgr_fake),
     # so it tracks the swapped face exactly per-frame — no landmark jitter,
@@ -792,63 +946,50 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
     is_file_target = modules.globals.target_path and (is_image(modules.globals.target_path) or is_video(modules.globals.target_path))
 
     if is_file_target:
-        # Processing specific image or video file with pre-analyzed maps
+        # Processing specific image or video file with pre-analyzed maps.
+        # NOTE: "many_faces" is intentionally NOT consulted here. map_faces
+        # mode means the user explicitly assigned a distinct source face per
+        # target identity in the mapper dialog, and that per-identity
+        # assignment must always be honored. (The "swap every face with one
+        # source" behavior that many_faces provides in simple mode already
+        # exists via process_frame() when map_faces is off — collapsing
+        # every mapped identity onto default_source_face() here would defeat
+        # the entire purpose of face mapping.)
         if source_target_map:
-            if modules.globals.many_faces:
-                source_face = default_source_face() # Use default source for all targets
-                if source_face:
-                    for map_data in source_target_map:
-                        if is_image(modules.globals.target_path):
-                            target_info = map_data.get("target", {})
-                            if target_info: # Check if target info exists
-                                target_face = target_info.get("face")
-                                if target_face:
-                                    source_target_pairs.append((source_face, target_face))
-                        elif is_video(modules.globals.target_path):
-                             # Find faces for the current frame_path in video map
-                             target_frames_data = map_data.get("target_faces_in_frame", [])
-                             if target_frames_data: # Check if frame data exists
-                                 target_frames = [f for f in target_frames_data if f and f.get("location") == temp_frame_path]
-                                 for frame_data in target_frames:
-                                     faces_in_frame = frame_data.get("faces", [])
-                                     if faces_in_frame: # Check if faces exist
-                                         for target_face in faces_in_frame:
-                                             source_target_pairs.append((source_face, target_face))
-            else: # Single face or specific mapping
-                 for map_data in source_target_map:
-                    source_info = map_data.get("source", {})
-                    if not source_info:
-                        continue # Skip if no source info
-                    source_face = source_info.get("face")
-                    if not source_face:
-                        continue # Skip if no source defined for this map entry
+             for map_data in source_target_map:
+                source_info = map_data.get("source", {})
+                if not source_info:
+                    continue # Skip if no source info
+                source_face = source_info.get("face")
+                if not source_face:
+                    continue # Skip if no source defined for this map entry
 
-                    if is_image(modules.globals.target_path):
-                        target_info = map_data.get("target", {})
-                        if target_info:
-                           target_face = target_info.get("face")
-                           if target_face:
-                              source_target_pairs.append((source_face, target_face))
-                    elif is_video(modules.globals.target_path):
-                        target_frames_data = map_data.get("target_faces_in_frame", [])
-                        if target_frames_data:
-                           target_frames = [f for f in target_frames_data if f and f.get("location") == temp_frame_path]
-                           for frame_data in target_frames:
-                               faces_in_frame = frame_data.get("faces", [])
-                               if faces_in_frame:
-                                  for target_face in faces_in_frame:
-                                      source_target_pairs.append((source_face, target_face))
+                if is_image(modules.globals.target_path):
+                    target_info = map_data.get("target", {})
+                    if target_info:
+                       target_face = target_info.get("face")
+                       if target_face:
+                          source_target_pairs.append((source_face, target_face))
+                elif is_video(modules.globals.target_path):
+                    target_frames_data = map_data.get("target_faces_in_frame", [])
+                    if target_frames_data:
+                       target_frames = [f for f in target_frames_data if f and f.get("location") == temp_frame_path]
+                       for frame_data in target_frames:
+                           faces_in_frame = frame_data.get("faces", [])
+                           if faces_in_frame:
+                              for target_face in faces_in_frame:
+                                  source_target_pairs.append((source_face, target_face))
 
     else:
-        # Live stream or webcam processing (analyze faces on the fly)
+        # Live stream or webcam processing (analyze faces on the fly).
+        # NOTE: "many_faces" is intentionally NOT consulted here either —
+        # see the comment in the is_file_target branch above. When a
+        # simple_map exists (built by the live face mapper), each detected
+        # face must be matched to its own assigned source by embedding
+        # similarity, never collapsed onto a single default source.
         detected_faces = get_many_faces(processed_frame)
         if detected_faces:
-            if modules.globals.many_faces:
-                 source_face = default_source_face() # Use default source for all detected targets
-                 if source_face:
-                     for target_face in detected_faces:
-                        source_target_pairs.append((source_face, target_face))
-            elif simple_map:
+            if simple_map:
                 # Use simple_map (source_faces <-> target_embeddings)
                 source_faces = simple_map.get("source_faces", [])
                 target_embeddings = simple_map.get("target_embeddings", [])
@@ -1485,6 +1626,78 @@ def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
         pass
 
     return mask # Return uint8 mask
+
+
+def create_beard_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
+    """Creates a mask covering the jaw/chin/cheek area (below the mouth line),
+    so the target's real beard/jawline can be pasted back over the swap.
+
+    Built on the same verified landmark ranges as create_face_mask (jaw
+    contour, indices 0-32) and create_lower_mouth_mask (mouth outline,
+    indices 52-63) rather than the unverified index ranges elsewhere in
+    face_masking.py — the jaw contour is clipped to a flat line at mouth
+    height so the polygon covers jaw+chin+cheeks without extending up into
+    the eyes/nose/forehead.
+    """
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    beard_cutout = None
+    beard_polygon = None
+    beard_box = (0, 0, 0, 0)
+
+    landmarks = getattr(face, "landmark_2d_106", None)
+    if landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape[0] < 106:
+        return mask, beard_cutout, beard_box, beard_polygon
+
+    try:
+        if not np.all(np.isfinite(landmarks)):
+            return mask, beard_cutout, beard_box, beard_polygon
+
+        jaw = landmarks[0:33].astype(np.float32)
+        mouth = landmarks[52:64].astype(np.float32)
+        mouth_center_y = float(np.mean(mouth[:, 1]))
+
+        size = max(0.0, min(2.0, getattr(modules.globals, "beard_mask_size", 1.0)))
+        # Small upward margin above the mouth line so the mask doesn't
+        # immediately butt up against the (separately toggle-able) mouth mask.
+        cutoff_y = mouth_center_y - 6.0 * size
+
+        jaw_clipped = jaw.copy()
+        jaw_clipped[:, 1] = np.maximum(jaw_clipped[:, 1], cutoff_y)
+
+        if not np.all(np.isfinite(jaw_clipped)):
+            return mask, beard_cutout, beard_box, beard_polygon
+
+        polygon = jaw_clipped.astype(np.int32)
+        min_x, min_y = np.min(polygon, axis=0)
+        max_x, max_y = np.max(polygon, axis=0)
+
+        pad = int(max(max_x - min_x, max_y - min_y) * 0.05)
+        frame_h, frame_w = frame.shape[:2]
+        min_x = max(0, min_x - pad)
+        min_y = max(0, min_y - pad)
+        max_x = min(frame_w, max_x + pad)
+        max_y = min(frame_h, max_y + pad)
+
+        if max_x <= min_x or max_y <= min_y:
+            return mask, beard_cutout, beard_box, beard_polygon
+
+        roi_h, roi_w = max_y - min_y, max_x - min_x
+        mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        poly_rel = polygon - [min_x, min_y]
+        cv2.fillPoly(mask_roi, [poly_rel], 255)
+        mask_roi = gpu_gaussian_blur(mask_roi, (21, 21), 8)
+
+        mask[min_y:max_y, min_x:max_x] = mask_roi
+        beard_cutout = frame[min_y:max_y, min_x:max_x].copy()
+        beard_polygon = polygon
+        beard_box = (int(min_x), int(min_y), int(max_x), int(max_y))
+
+    except IndexError:
+        pass
+    except Exception as e:
+        print(f"Error creating beard mask: {e}")
+
+    return mask, beard_cutout, beard_box, beard_polygon
 
 
 def apply_color_transfer(source, target):

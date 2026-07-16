@@ -41,6 +41,8 @@ live_resizable: bool = True
 camera_input_combobox: Any | None = None # Placeholder for UI element if needed
 webcam_preview_running: bool = False
 show_fps: bool = False
+live_capture_width: int = 640   # Lower = faster detect/swap on CPU, at the cost of preview sharpness
+live_capture_height: int = 360
 
 # System Configuration
 max_memory: int | None = None        # Memory limit in GB? (Needs clarification)
@@ -64,6 +66,23 @@ mask_feather_ratio: int = 12       # Denominator for feathering calculation (hig
 mask_down_size: float = 0.1        # Expansion factor for lower lip mask (relative)
 mask_size: float = 1.0             # Expansion factor for upper lip mask (relative)
 mouth_mask_size: float = 0.0       # Mouth mask size (0-100; 0=off, 100=mouth to chin)
+
+# Eyes Mask Options
+eyes_mask: bool = False            # Keep the target's original eyes instead of the swapped ones
+eyes_mask_size: float = 1.0        # Expansion factor for the eye cutout region (relative)
+
+# Beard / Jaw Mask Options
+beard_mask: bool = False           # Keep the target's original beard/jawline instead of the swapped one
+beard_mask_size: float = 1.0       # Expansion factor for the beard/jaw cutout region (relative)
+
+# Skin Tone Match — color-matches the swapped face crop to the target's skin tone/lighting
+skin_tone_match: bool = False
+
+# Local contrast/lighting match (CLAHE) on the swapped face crop
+clahe_match: bool = False
+
+# Edge Feather — sigma of the Gaussian blur used to soften the swap boundary
+edge_feather: float = 12.0
 
 # --- START: Added for Frame Interpolation ---
 enable_interpolation: bool = True # Toggle temporal smoothing

@@ -22,7 +22,7 @@ from modules.processors.frame._onnx_enhancer import (
 
 NAME = "DLC.FACE-ENHANCER-GPEN512"
 INPUT_SIZE = 512
-MODEL_URL = "https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/GPEN-BFR/GPEN-BFR-512.onnx"
+MODEL_URL = "https://github.com/harisreedhar/Face-Upscalers-ONNX/releases/download/Models/GPEN-BFR-512.onnx"
 MODEL_FILE = "GPEN-BFR-512.onnx"
 
 ENHANCER = None
