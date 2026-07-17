@@ -339,6 +339,14 @@ def save_switch_states():
         "mouth_mask_size": modules.globals.mouth_mask_size,
         "eyes_mask": modules.globals.eyes_mask,
         "beard_mask": modules.globals.beard_mask,
+        "eyebrows_mask": modules.globals.eyebrows_mask,
+        "forehead_mask": modules.globals.forehead_mask,
+        "glasses_mask": modules.globals.glasses_mask,
+        "max_coverage_mode": modules.globals.max_coverage_mode,
+        "denoise_webcam": modules.globals.denoise_webcam,
+        "mask_stabilization": modules.globals.mask_stabilization,
+        "pose_adaptive_masks": modules.globals.pose_adaptive_masks,
+        "face_parsing_masks": modules.globals.face_parsing_masks,
         "skin_tone_match": modules.globals.skin_tone_match,
         "clahe_match": modules.globals.clahe_match,
     }
@@ -372,6 +380,14 @@ def load_switch_states():
         modules.globals.show_mouth_mask_box = False
         modules.globals.eyes_mask = state.get("eyes_mask", False)
         modules.globals.beard_mask = state.get("beard_mask", False)
+        modules.globals.eyebrows_mask = state.get("eyebrows_mask", False)
+        modules.globals.forehead_mask = state.get("forehead_mask", False)
+        modules.globals.glasses_mask = state.get("glasses_mask", False)
+        modules.globals.max_coverage_mode = state.get("max_coverage_mode", False)
+        modules.globals.denoise_webcam = state.get("denoise_webcam", False)
+        modules.globals.mask_stabilization = state.get("mask_stabilization", False)
+        modules.globals.pose_adaptive_masks = state.get("pose_adaptive_masks", False)
+        modules.globals.face_parsing_masks = state.get("face_parsing_masks", False)
         modules.globals.skin_tone_match = state.get("skin_tone_match", False)
         modules.globals.clahe_match = state.get("clahe_match", False)
     except FileNotFoundError:
@@ -671,6 +687,22 @@ class MainWindow(QMainWindow):
                                  "Keep your real eyes instead of the swapped ones")
         self.sw_beard_mask = make("beard_mask", "Beard/Jaw Mask",
                                   "Keep your real beard and jawline instead of the swapped one")
+        self.sw_eyebrows_mask = make("eyebrows_mask", "Eyebrows Mask",
+                                     "Keep your real eyebrows instead of the swapped ones")
+        self.sw_forehead_mask = make("forehead_mask", "Forehead Mask",
+                                     "Keep your real forehead/hairline instead of the swapped one")
+        self.sw_glasses_mask = make("glasses_mask", "Glasses Mask",
+                                    "Keep your real eyeglasses instead of letting the swap erase them")
+        self.sw_max_coverage = make("max_coverage_mode", "Max Coverage Mode",
+                                    "Disable all preserve-masks above to maximize source face coverage")
+        self.sw_denoise_webcam = make("denoise_webcam", "Denoise Webcam",
+                                      "Smooth sensor noise from the webcam before detection/swap")
+        self.sw_mask_stabilization = make("mask_stabilization", "Temporal Mask Stabilization",
+                                          "Smooth preserve-mask jitter across frames on a still face (snaps back on real movement)")
+        self.sw_pose_adaptive = make("pose_adaptive_masks", "Pose-Adaptive Masks",
+                                     "Shrink preserve-mask expansion as the face turns away from frontal")
+        self.sw_face_parsing = make("face_parsing_masks", "Face-Parsing Precision Mode",
+                                    "Pixel-accurate mouth/eyes/eyebrows/glasses masks + automatic hair occlusion (needs resnet18.onnx)")
         self.sw_skin_tone = make("skin_tone_match", "Skin Tone Match",
                                  "Color-match the swapped face to your actual skin tone/lighting")
         self.sw_clahe = make("clahe_match", "Local Contrast Match",
@@ -688,6 +720,11 @@ class MainWindow(QMainWindow):
             self.sw_map_faces, self.sw_show_fps,
             self.sw_poisson, self.sw_color_fix,
             self.sw_eyes_mask, self.sw_beard_mask,
+            self.sw_eyebrows_mask, self.sw_forehead_mask,
+            self.sw_glasses_mask, self.sw_max_coverage,
+            self.sw_denoise_webcam,
+            self.sw_mask_stabilization, self.sw_pose_adaptive,
+            self.sw_face_parsing,
             self.sw_skin_tone, self.sw_clahe,
         ]
         for i, w in enumerate(items):
@@ -698,7 +735,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(enhancer_label, len(items) // 2, 0)
 
         self.cb_enhancer = QComboBox()
-        self.cb_enhancer.addItems(["None", "GFPGAN", "GPEN-512", "GPEN-256"])
+        self.cb_enhancer.addItems(["None", "GFPGAN", "GPEN-512", "GPEN-256", "CodeFormer"])
         initial = "None"
         if modules.globals.fp_ui.get("face_enhancer", False):
             initial = "GFPGAN"
@@ -706,6 +743,8 @@ class MainWindow(QMainWindow):
             initial = "GPEN-512"
         elif modules.globals.fp_ui.get("face_enhancer_gpen256", False):
             initial = "GPEN-256"
+        elif modules.globals.fp_ui.get("face_enhancer_codeformer", False):
+            initial = "CodeFormer"
         self.cb_enhancer.setCurrentText(initial)
         self.cb_enhancer.currentTextChanged.connect(self._on_enhancer_change)
         self.cb_enhancer.setToolTip(_("Select a face enhancement model (None = no enhancement)"))
@@ -768,6 +807,86 @@ class MainWindow(QMainWindow):
             _("How soft the blend edge is between the swapped face and the original frame")
         )
         grid.addWidget(self.s_feather, 4, 1)
+
+        # Per-region mask opacity — how strongly each preserve-mask restores
+        # the original region (100 = fully original, same as the toggle alone).
+        opacity_fields = [
+            ("mouth_mask_opacity", "Mouth Opacity",
+             "How much of the original mouth region shows through when Mouth Mask is on"),
+            ("eyes_mask_opacity", "Eyes Opacity",
+             "How much of the original eyes region shows through when Eyes Mask is on"),
+            ("beard_mask_opacity", "Beard Opacity",
+             "How much of the original beard/jaw region shows through when Beard/Jaw Mask is on"),
+            ("eyebrows_mask_opacity", "Eyebrows Opacity",
+             "How much of the original eyebrows region shows through when Eyebrows Mask is on"),
+            ("forehead_mask_opacity", "Forehead Opacity",
+             "How much of the original forehead/hairline shows through when Forehead Mask is on"),
+            ("glasses_mask_opacity", "Glasses Opacity",
+             "How much of the original glasses region shows through when Glasses Mask is on"),
+        ]
+        self._opacity_sliders = {}
+        row = 5
+        for field, label, tip in opacity_fields:
+            grid.addWidget(QLabel(_(label)), row, 0)
+            default = getattr(modules.globals, field, 1.0)
+            s = slider(0.0, 1.0, default, 100,
+                       lambda v, f=field: self._on_region_opacity_change(f, v))
+            s.setToolTip(_(tip))
+            grid.addWidget(s, row, 1)
+            self._opacity_sliders[field] = s
+            row += 1
+
+        # Hairline feather — extra softening near the top of the face mask
+        grid.addWidget(QLabel(_("Hairline Feather")), row, 0)
+        self.s_hairline_feather = slider(0.0, 40.0, 0.0, 1, self._on_hairline_feather_change)
+        self.s_hairline_feather.setToolTip(
+            _("Extra softening where the swapped face meets the hairline/forehead (0 = off)")
+        )
+        grid.addWidget(self.s_hairline_feather, row, 1)
+        row += 1
+
+        # Mask stabilization weight — only takes effect when the Temporal
+        # Mask Stabilization switch above is on.
+        grid.addWidget(QLabel(_("Mask Stabilization Weight")), row, 0)
+        self.s_mask_stabilization_weight = slider(
+            0.0, 1.0, modules.globals.mask_stabilization_weight, 100,
+            self._on_mask_stabilization_weight_change,
+        )
+        self.s_mask_stabilization_weight.setToolTip(
+            _("Lower = smoother/laggier mask edges; higher = more responsive (needs Temporal Mask Stabilization on)")
+        )
+        grid.addWidget(self.s_mask_stabilization_weight, row, 1)
+        row += 1
+
+        # Skin detail transfer — frequency-separation, 0 = off
+        grid.addWidget(QLabel(_("Skin Detail Transfer")), row, 0)
+        self.s_skin_detail = slider(0.0, 1.0, 0.0, 100, self._on_skin_detail_change)
+        self.s_skin_detail.setToolTip(
+            _("Keep the target's real skin texture instead of the swap's own (0 = off)")
+        )
+        grid.addWidget(self.s_skin_detail, row, 1)
+        row += 1
+
+        # Shape correction — anisotropic jaw-aspect correction toward the target, 0 = off
+        grid.addWidget(QLabel(_("Shape Correction")), row, 0)
+        self.s_shape_correction = slider(0.0, 1.0, 0.0, 100, self._on_shape_correction_change)
+        self.s_shape_correction.setToolTip(
+            _("Stretch the swapped face toward the target's actual jaw proportions (0 = off)")
+        )
+        grid.addWidget(self.s_shape_correction, row, 1)
+        row += 1
+
+        # CodeFormer fidelity — only takes effect when CodeFormer is the selected enhancer
+        grid.addWidget(QLabel(_("CodeFormer Fidelity")), row, 0)
+        self.s_codeformer_fidelity = slider(
+            0.0, 1.0, modules.globals.codeformer_fidelity, 100,
+            self._on_codeformer_fidelity_change,
+        )
+        self.s_codeformer_fidelity.setToolTip(
+            _("Lower = higher quality/more generated, higher = closer to the input face (needs CodeFormer enhancer selected)")
+        )
+        grid.addWidget(self.s_codeformer_fidelity, row, 1)
+
         return card
 
     # ── action row ───────────────────────────────────────────────────────
@@ -803,8 +922,13 @@ class MainWindow(QMainWindow):
         cam_row.addWidget(QLabel(_("Select Camera:")))
         self._camera_indices, self._camera_names = get_available_cameras()
 
+        remote_url = os.environ.get("DLC_REMOTE_CAMERA_URL")
         self.cb_camera = QComboBox()
-        if not self._camera_names or self._camera_names[0] == "No cameras found":
+        if remote_url:
+            self.cb_camera.addItem(f"Remote stream: {remote_url}")
+            self.cb_camera.setEnabled(False)
+            cam_ok = True
+        elif not self._camera_names or self._camera_names[0] == "No cameras found":
             self.cb_camera.addItem("No cameras found")
             self.cb_camera.setEnabled(False)
             cam_ok = False
@@ -886,6 +1010,7 @@ class MainWindow(QMainWindow):
             ("modules.processors.frame.face_enhancer", "FACE_ENHANCER"),
             ("modules.processors.frame.face_enhancer_gpen256", "ENHANCER"),
             ("modules.processors.frame.face_enhancer_gpen512", "ENHANCER"),
+            ("modules.processors.frame.face_enhancer_codeformer", "ENHANCER"),
         ):
             try:
                 mod = importlib.import_module(mod_name)
@@ -1000,8 +1125,9 @@ class MainWindow(QMainWindow):
             "GFPGAN": "face_enhancer",
             "GPEN-512": "face_enhancer_gpen512",
             "GPEN-256": "face_enhancer_gpen256",
+            "CodeFormer": "face_enhancer_codeformer",
         }
-        for key in ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512"):
+        for key in ("face_enhancer", "face_enhancer_gpen256", "face_enhancer_gpen512", "face_enhancer_codeformer"):
             _update_tumbler(key, False)
         selected = key_map.get(choice)
         if selected:
@@ -1050,6 +1176,24 @@ class MainWindow(QMainWindow):
 
     def _on_feather_change(self, value: float) -> None:
         modules.globals.edge_feather = value
+
+    def _on_region_opacity_change(self, field: str, value: float) -> None:
+        setattr(modules.globals, field, value)
+
+    def _on_hairline_feather_change(self, value: float) -> None:
+        modules.globals.hairline_feather = value
+
+    def _on_mask_stabilization_weight_change(self, value: float) -> None:
+        modules.globals.mask_stabilization_weight = value
+
+    def _on_skin_detail_change(self, value: float) -> None:
+        modules.globals.skin_detail_strength = value
+
+    def _on_shape_correction_change(self, value: float) -> None:
+        modules.globals.shape_correction_strength = value
+
+    def _on_codeformer_fidelity_change(self, value: float) -> None:
+        modules.globals.codeformer_fidelity = value
 
     def _on_start(self) -> None:
         if _MAPPER is not None and _MAPPER.isVisible():
@@ -1102,11 +1246,20 @@ class MainWindow(QMainWindow):
             _PREVIEW.show()
 
     def _on_live(self) -> None:
-        idx = self.cb_camera.currentIndex()
-        if idx < 0 or idx >= len(self._camera_indices):
-            update_status("No camera available")
-            return
-        camera_index = self._camera_indices[idx]
+        # DLC_REMOTE_CAMERA_URL lets "Live" read from a network stream
+        # (e.g. tcp://0.0.0.0:12345?listen) instead of a local camera --
+        # used when the camera is on a different machine than the one
+        # doing the GPU processing. Local camera enumeration is skipped
+        # entirely when this is set.
+        remote_url = os.environ.get("DLC_REMOTE_CAMERA_URL")
+        if remote_url:
+            camera_index = remote_url
+        else:
+            idx = self.cb_camera.currentIndex()
+            if idx < 0 or idx >= len(self._camera_indices):
+                update_status("No camera available")
+                return
+            camera_index = self._camera_indices[idx]
         if _LIVE_MAPPER is not None and _LIVE_MAPPER.isVisible():
             update_status("Source x Target Mapper is already open.")
             _LIVE_MAPPER.raise_()
@@ -1284,13 +1437,18 @@ class _ProcessingWorker(QThread):
                     cached_faces = [cached_target_face]
 
                 # Fast detection skips the 2d106 landmark model, but mouth/
-                # eyes/beard masking need it. Attach landmarks on demand
-                # (computed once per detection cycle — the helper no-ops if
-                # already present).
+                # eyes/beard/eyebrows/forehead/glasses masking need it. Attach
+                # landmarks on demand (computed once per detection cycle —
+                # the helper no-ops if already present).
                 if (
                     modules.globals.mouth_mask
                     or modules.globals.eyes_mask
                     or modules.globals.beard_mask
+                    or modules.globals.eyebrows_mask
+                    or modules.globals.forehead_mask
+                    or modules.globals.glasses_mask
+                    or modules.globals.shape_correction_strength > 0
+                    or modules.globals.skin_detail_strength > 0
                 ) and cached_faces:
                     ensure_landmarks(temp_frame, cached_faces)
 
@@ -1307,6 +1465,11 @@ class _ProcessingWorker(QThread):
                             )
                     elif fp.NAME == "DLC.FACE-ENHANCER-GPEN512":
                         if modules.globals.fp_ui.get("face_enhancer_gpen512", False):
+                            temp_frame = fp.process_frame(
+                                None, temp_frame, detected_faces=cached_faces
+                            )
+                    elif fp.NAME == "DLC.FACE-ENHANCER-CODEFORMER":
+                        if modules.globals.fp_ui.get("face_enhancer_codeformer", False):
                             temp_frame = fp.process_frame(
                                 None, temp_frame, detected_faces=cached_faces
                             )
@@ -1337,7 +1500,7 @@ class _ProcessingWorker(QThread):
                     if fp.NAME == "DLC.FACE-ENHANCER":
                         if modules.globals.fp_ui["face_enhancer"]:
                             temp_frame = fp.process_frame_v2(temp_frame)
-                    elif fp.NAME in ("DLC.FACE-ENHANCER-GPEN256", "DLC.FACE-ENHANCER-GPEN512"):
+                    elif fp.NAME in ("DLC.FACE-ENHANCER-GPEN256", "DLC.FACE-ENHANCER-GPEN512", "DLC.FACE-ENHANCER-CODEFORMER"):
                         fp_key = fp.NAME.split(".")[-1].lower().replace("-", "_")
                         if modules.globals.fp_ui.get(fp_key, False):
                             temp_frame = fp.process_frame_v2(temp_frame)

@@ -124,14 +124,21 @@ def _optimize_det_model(fa: Any, providers) -> None:
 def _needs_landmark() -> bool:
     """Check whether any active feature requires 106-point landmarks.
 
-    Landmarks are needed by face enhancers, mouth masking, eyes masking,
-    and beard/jaw masking, but not by the face swapper alone.
+    Landmarks are needed by face enhancers and all the preserve-masks
+    (mouth/eyes/beard/eyebrows/forehead/glasses), but not by the face
+    swapper alone.
     """
-    if getattr(modules.globals, "mouth_mask", False):
+    mask_toggles = (
+        "mouth_mask", "eyes_mask", "beard_mask",
+        "eyebrows_mask", "forehead_mask", "glasses_mask",
+    )
+    if any(getattr(modules.globals, t, False) for t in mask_toggles):
         return True
-    if getattr(modules.globals, "eyes_mask", False):
+    # Shape correction and skin detail transfer are float-strength features
+    # (no matching bool), but both need target/source landmarks too.
+    if getattr(modules.globals, "shape_correction_strength", 0.0) > 0:
         return True
-    if getattr(modules.globals, "beard_mask", False):
+    if getattr(modules.globals, "skin_detail_strength", 0.0) > 0:
         return True
     processors = getattr(modules.globals, "frame_processors", [])
     return any(p in processors for p in

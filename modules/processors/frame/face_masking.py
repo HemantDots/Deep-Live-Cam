@@ -32,6 +32,42 @@ def apply_color_transfer(source, target):
     result_bgr = cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
     return np.clip(result_bgr * 255.0, 0, 255).astype(np.uint8)
 
+def estimate_pose_scale(landmarks: np.ndarray) -> float:
+    """Rough yaw-turn proxy built only from landmark ranges already verified
+    correct elsewhere in this codebase (jaw contour 0-32, right eye 33-42,
+    left eye 87-96) — no dedicated pose/3D model is loaded, so this doesn't
+    claim a true pose angle, only how far the apparent eye midpoint has
+    drifted from the jaw's horizontal center, which grows as the face turns
+    away from frontal.
+
+    Returns a 0.5-1.0 multiplier: 1.0 = frontal (no change), shrinking
+    toward 0.5 at extreme yaw so mask expansion doesn't overshoot into
+    hair/background at profile angles.
+    """
+    try:
+        jaw = landmarks[0:33]
+        right_eye = landmarks[33:42]
+        left_eye = landmarks[87:96]
+        jaw_min_x = np.min(jaw[:, 0])
+        jaw_max_x = np.max(jaw[:, 0])
+        face_width = jaw_max_x - jaw_min_x
+        if face_width <= 1e-3:
+            return 1.0
+        face_center_x = (jaw_min_x + jaw_max_x) / 2.0
+        eyes_mid_x = (np.mean(right_eye[:, 0]) + np.mean(left_eye[:, 0])) / 2.0
+        yaw_offset = (eyes_mid_x - face_center_x) / (face_width / 2.0)
+        yaw_offset = max(-1.0, min(1.0, float(yaw_offset)))
+        return 1.0 - 0.5 * abs(yaw_offset)
+    except Exception:
+        return 1.0
+
+
+def _pose_scale(landmarks: np.ndarray) -> float:
+    if not getattr(modules.globals, "pose_adaptive_masks", False):
+        return 1.0
+    return estimate_pose_scale(landmarks)
+
+
 def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
     landmarks = face.landmark_2d_106
@@ -165,11 +201,14 @@ def create_eyes_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tuple
         right_eye_center = np.mean(right_eye, axis=0).astype(np.int32)
         
         # Calculate eye dimensions with size adjustment
+        pose_scale = _pose_scale(landmarks)
+
         def get_eye_dimensions(eye_points):
             x_coords = eye_points[:, 0]
             y_coords = eye_points[:, 1]
-            width = int((np.max(x_coords) - np.min(x_coords)) * (1 + modules.globals.mask_down_size * modules.globals.eyes_mask_size))
-            height = int((np.max(y_coords) - np.min(y_coords)) * (1 + modules.globals.mask_down_size * modules.globals.eyes_mask_size))
+            expansion = modules.globals.mask_down_size * modules.globals.eyes_mask_size * pose_scale
+            width = int((np.max(x_coords) - np.min(x_coords)) * (1 + expansion))
+            height = int((np.max(y_coords) - np.min(y_coords)) * (1 + expansion))
             return width, height
         
         left_width, left_height = get_eye_dimensions(left_eye)
@@ -304,7 +343,7 @@ def create_eyebrows_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, t
         
         # Calculate bounding box with padding adjusted by size
         all_points = np.vstack([left_eyebrow, right_eyebrow])
-        padding_factor = modules.globals.eyebrows_mask_size
+        padding_factor = modules.globals.eyebrows_mask_size * _pose_scale(landmarks)
         min_x = np.min(all_points[:, 0]) - 25 * padding_factor
         max_x = np.max(all_points[:, 0]) + 25 * padding_factor
         min_y = np.min(all_points[:, 1]) - 20 * padding_factor

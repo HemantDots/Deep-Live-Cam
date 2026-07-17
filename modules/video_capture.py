@@ -5,6 +5,8 @@ from typing import Optional, Tuple, Callable
 import platform
 import threading
 
+import modules.globals
+
 # Only import Windows-specific library if on Windows
 if platform.system() == "Windows":
     from pygrabber.dshow_graph import FilterGraph
@@ -118,6 +120,11 @@ class VideoCapturer:
 
         ret, frame = self.cap.read()
         if ret:
+            if getattr(modules.globals, "denoise_webcam", False):
+                # Fast edge-preserving denoise for noisy/low-light webcams.
+                # bilateralFilter is used (not fastNlMeans) because it's cheap
+                # enough for real-time live-mode frame rates.
+                frame = cv2.bilateralFilter(frame, d=5, sigmaColor=50, sigmaSpace=50)
             self._current_frame = frame
             if self.frame_callback:
                 self.frame_callback(frame)

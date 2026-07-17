@@ -52,7 +52,16 @@ headless: bool | None = None         # Run without UI?
 log_level: str = "error"             # Logging level (e.g., 'debug', 'info', 'warning', 'error')
 
 # Face Processor UI Toggles (Example)
-fp_ui: Dict[str, bool] = {"face_enhancer": False, "face_enhancer_gpen256": False, "face_enhancer_gpen512": False}
+fp_ui: Dict[str, bool] = {
+    "face_enhancer": False,
+    "face_enhancer_gpen256": False,
+    "face_enhancer_gpen512": False,
+    "face_enhancer_codeformer": False,
+}
+
+# CodeFormer fidelity weight (0.0-1.0): lower = higher quality/more generated,
+# higher = closer to the input face. 0.9 matches CodeFormer's own default.
+codeformer_fidelity: float = 0.9
 
 # Face Swapper Specific Options
 face_swapper_enabled: bool = True # General toggle for the swapper processor
@@ -74,6 +83,74 @@ eyes_mask_size: float = 1.0        # Expansion factor for the eye cutout region 
 # Beard / Jaw Mask Options
 beard_mask: bool = False           # Keep the target's original beard/jawline instead of the swapped one
 beard_mask_size: float = 1.0       # Expansion factor for the beard/jaw cutout region (relative)
+
+# Eyebrows Mask Options
+eyebrows_mask: bool = False        # Keep the target's original eyebrows instead of the swapped ones
+eyebrows_mask_size: float = 1.0    # Expansion factor for the eyebrows cutout region (relative)
+
+# Forehead / Hairline Mask Options
+forehead_mask: bool = False        # Keep the target's original forehead/hairline instead of the swapped one
+forehead_mask_size: float = 1.0    # Expansion factor for the forehead cutout region (relative)
+
+# Glasses Mask Options — preserves the target's eyeglasses (wider than the eyes mask
+# so it also covers the frame/temple area) instead of letting the swap erase them
+glasses_mask: bool = False
+glasses_mask_size: float = 1.0
+
+# Per-region mask opacity (0.0-1.0): how strongly the target's original pixels are
+# restored for each region above. 1.0 = fully restore original (same as before these
+# existed), lower values partially blend the swap back in.
+mouth_mask_opacity: float = 1.0
+eyes_mask_opacity: float = 1.0
+beard_mask_opacity: float = 1.0
+eyebrows_mask_opacity: float = 1.0
+forehead_mask_opacity: float = 1.0
+glasses_mask_opacity: float = 1.0
+
+# Max Coverage Mode — when enabled, forces all preserve-masks above off for the
+# frame regardless of their individual toggles, maximizing how much of the source
+# face is applied (closest achievable approximation of an "exact head swap").
+max_coverage_mode: bool = False
+
+# Hairline Feather — extra softening (Gaussian sigma) applied near the top edge of
+# the whole-face mask, easing the seam where the swapped face meets the hairline.
+hairline_feather: float = 0.0
+
+# Webcam Denoise — light bilateral-filter pre-pass on captured webcam frames before
+# detection/swap, to reduce sensor noise (mainly helps low-light webcams).
+denoise_webcam: bool = False
+
+# Temporal Mask Stabilization — smooths preserve-mask polygon jitter across
+# frames (video/live) to reduce boundary flicker. Snaps to the raw polygon
+# instead of blending when the face moves more than a small threshold, so
+# real head movement doesn't drag a stale mask behind it.
+mask_stabilization: bool = False
+mask_stabilization_weight: float = 0.5  # current-frame weight; lower = smoother/laggier
+
+# Pose-Adaptive Mask Sizing — shrinks preserve-mask expansion as the face
+# turns away from frontal (estimated from landmarks only, no pose model),
+# instead of using the same fixed expansion at every angle.
+pose_adaptive_masks: bool = False
+
+# Frequency-Separation Skin Detail Transfer — keeps the target's real skin
+# texture (pores/wrinkles) while taking color/tone from the swapped face,
+# instead of the swap's own (often smoother/"plastic") skin detail.
+# 0.0 = off (default, no change to existing behavior), 1.0 = fully use the
+# target's original detail layer.
+skin_detail_strength: float = 0.0
+
+# Post-Swap Shape Correction — anisotropically stretches the generated face
+# toward the target's actual jaw width/height proportions (estimated from
+# landmarks only), so the target's real head shape shows through more than
+# the source identity's shape. 0.0 = off (default), 1.0 = full correction.
+shape_correction_strength: float = 0.0
+
+# Face-Parsing Precision Mode — uses BiSeNet semantic segmentation (pixel-
+# accurate mouth/eyes/eyebrows/glasses regions, plus automatic hair
+# occlusion) instead of landmark-geometry approximations for the masks that
+# have a matching class. Also makes glasses restoration auto-detect (no
+# glasses found -> no-op) instead of always covering a guessed eye band.
+face_parsing_masks: bool = False
 
 # Skin Tone Match — color-matches the swapped face crop to the target's skin tone/lighting
 skin_tone_match: bool = False

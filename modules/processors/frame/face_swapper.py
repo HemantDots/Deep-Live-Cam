@@ -18,7 +18,7 @@ from modules.utilities import (
 )
 from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
-from modules.processors.frame.face_masking import create_eyes_mask
+from modules.processors.frame.face_masking import create_eyes_mask, create_eyebrows_mask, estimate_pose_scale
 from insightface.utils import face_align
 import os
 from collections import deque
@@ -41,6 +41,145 @@ PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previou
 # one frame. Gated to live mode + single-face only (see swap_face()).
 _SWAP_LIVE_CACHE = {'bgr_fake': None, 'frame_count': 0}
 _SWAP_SKIP_INTERVAL = 2  # run the real GAN inference every N frames
+
+# Temporal Mask Stabilization: per-region cache of the previous frame's mask
+# polygon, keyed by region name ("mouth", "eyes", ...). Only meaningful for a
+# single tracked face — disabled outright in many_faces mode (see swap_face)
+# since a shared key would blend different people's polygons together.
+_MASK_POLYGON_CACHE = {}
+
+
+def _pose_scale(landmarks: np.ndarray) -> float:
+    if landmarks is None or not getattr(modules.globals, "pose_adaptive_masks", False):
+        return 1.0
+    return estimate_pose_scale(landmarks)
+
+
+def _stabilize_polygon(key: str, polygon: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Exponentially smooths a mask polygon's points across frames to reduce
+    boundary flicker from landmark jitter. Snaps to the raw polygon (no lag)
+    when the face has moved more than a small pixel threshold, so real head
+    movement doesn't drag a stale mask behind it — only jitter on a
+    relatively still face gets smoothed.
+    """
+    if not getattr(modules.globals, "mask_stabilization", False) or polygon is None:
+        _MASK_POLYGON_CACHE.pop(key, None)
+        return polygon
+
+    weight = getattr(modules.globals, "mask_stabilization_weight", 0.5)
+    weight = max(0.0, min(1.0, weight))
+
+    prev = _MASK_POLYGON_CACHE.get(key)
+    if prev is None or prev.shape != polygon.shape:
+        _MASK_POLYGON_CACHE[key] = polygon.astype(np.float32)
+        return polygon
+
+    motion_threshold = 25.0  # pixels — snap instead of blend past this
+    centroid_shift = float(np.linalg.norm(polygon.mean(axis=0) - prev.mean(axis=0)))
+    if centroid_shift > motion_threshold:
+        _MASK_POLYGON_CACHE[key] = polygon.astype(np.float32)
+        return polygon
+
+    blended = prev * (1.0 - weight) + polygon.astype(np.float32) * weight
+    _MASK_POLYGON_CACHE[key] = blended
+    return blended.astype(np.int32)
+
+
+def _jaw_aspect(landmarks: np.ndarray) -> float:
+    """Width/height ratio of the jaw contour (landmarks 0-32) — scale-
+    invariant, so it's comparable across two different images/resolutions."""
+    jaw = landmarks[0:33]
+    width = float(np.max(jaw[:, 0]) - np.min(jaw[:, 0]))
+    height = float(np.max(jaw[:, 1]) - np.min(jaw[:, 1]))
+    if height <= 1e-3:
+        return 1.0
+    return width / height
+
+
+def _apply_shape_correction(bgr_fake: np.ndarray, source_face: Face, target_face: Face) -> np.ndarray:
+    """Anisotropically stretches the generated face crop toward the target's
+    actual jaw width/height proportions, so the target's real head shape
+    shows through more than the source identity's shape leaking into the
+    swap model's output. Pure affine correction (no extra model/inference) —
+    a full non-rigid warp would need landmark detection on the generated
+    crop itself, which this avoids.
+    """
+    strength = getattr(modules.globals, "shape_correction_strength", 0.0)
+    strength = max(0.0, min(1.0, strength))
+    if strength <= 0.0:
+        return bgr_fake
+
+    src_lm = getattr(source_face, "landmark_2d_106", None)
+    tgt_lm = getattr(target_face, "landmark_2d_106", None)
+    if src_lm is None or tgt_lm is None:
+        return bgr_fake
+
+    try:
+        src_aspect = _jaw_aspect(src_lm)
+        tgt_aspect = _jaw_aspect(tgt_lm)
+        if src_aspect <= 1e-3:
+            return bgr_fake
+
+        ratio = max(0.7, min(1.4, tgt_aspect / src_aspect))  # clamp: avoid extreme distortion
+        scale_x = 1.0 + (np.sqrt(ratio) - 1.0) * strength
+        scale_y = 1.0 + (1.0 / np.sqrt(ratio) - 1.0) * strength
+
+        h, w = bgr_fake.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+        s_matrix = np.array([
+            [scale_x, 0, cx * (1 - scale_x)],
+            [0, scale_y, cy * (1 - scale_y)],
+        ], dtype=np.float32)
+        return cv2.warpAffine(bgr_fake, s_matrix, (w, h), borderMode=cv2.BORDER_REPLICATE)
+    except Exception:
+        return bgr_fake
+
+
+def apply_skin_detail_transfer(
+    swapped_frame: Frame, original_frame: Frame, face_mask: np.ndarray,
+    target_face: Face, strength: float,
+) -> Frame:
+    """Frequency-separation detail transfer: keeps the target's real skin
+    texture (pores/wrinkles — the high-frequency layer) while keeping the
+    swap's own color/tone (the low-frequency layer), instead of the swap's
+    own (often smoother) skin detail. At strength=0 this is an exact no-op
+    by construction (low+high of the same image reconstructs it exactly).
+    """
+    strength = max(0.0, min(1.0, strength))
+    if strength <= 0.0 or face_mask is None:
+        return swapped_frame
+
+    bbox = getattr(target_face, "bbox", None)
+    if bbox is None:
+        return swapped_frame
+
+    try:
+        x1, y1, x2, y2 = bbox.astype(int)
+        h, w = swapped_frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return swapped_frame
+
+        swapped_roi = swapped_frame[y1:y2, x1:x2].astype(np.float32)
+        original_roi = original_frame[y1:y2, x1:x2].astype(np.float32)
+        mask_roi = (face_mask[y1:y2, x1:x2].astype(np.float32) / 255.0)[:, :, np.newaxis]
+
+        sigma = 8.0
+        swapped_low = gpu_gaussian_blur(swapped_roi.astype(np.uint8), (0, 0), sigma).astype(np.float32)
+        original_low = gpu_gaussian_blur(original_roi.astype(np.uint8), (0, 0), sigma).astype(np.float32)
+        original_high = original_roi - original_low
+        swapped_high = swapped_roi - swapped_low
+
+        detail_roi = swapped_low + swapped_high * (1.0 - strength) + original_high * strength
+        detail_roi = np.clip(detail_roi, 0, 255).astype(np.float32)
+
+        blended_roi = (detail_roi * mask_roi + swapped_roi * (1.0 - mask_roi))
+        out = swapped_frame.copy()
+        out[y1:y2, x1:x2] = np.clip(blended_roi, 0, 255).astype(np.uint8)
+        return out
+    except Exception:
+        return swapped_frame
 
 # --- Poisson blend (ported from deep-live-cam-gumroad-edition) ---
 # Root-cause fix for the "wobble": the blend mask is NOT built from the
@@ -615,17 +754,31 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # mouth_mask or opacity < 1 need an unmodified original.
     opacity = getattr(modules.globals, "opacity", 1.0)
     opacity = max(0.0, min(1.0, opacity))
-    mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
-    eyes_mask_enabled = getattr(modules.globals, "eyes_mask", False)
-    beard_mask_enabled = getattr(modules.globals, "beard_mask", False)
+    # Max Coverage Mode overrides every preserve-mask off for this frame,
+    # regardless of their individual toggles — it's the "give me as much of
+    # the source face as the model can produce" switch.
+    max_coverage = getattr(modules.globals, "max_coverage_mode", False)
+    mouth_mask_enabled = (not max_coverage) and getattr(modules.globals, "mouth_mask", False)
+    eyes_mask_enabled = (not max_coverage) and getattr(modules.globals, "eyes_mask", False)
+    beard_mask_enabled = (not max_coverage) and getattr(modules.globals, "beard_mask", False)
+    eyebrows_mask_enabled = (not max_coverage) and getattr(modules.globals, "eyebrows_mask", False)
+    forehead_mask_enabled = (not max_coverage) and getattr(modules.globals, "forehead_mask", False)
+    glasses_mask_enabled = (not max_coverage) and getattr(modules.globals, "glasses_mask", False)
+    face_parsing_enabled = (not max_coverage) and getattr(modules.globals, "face_parsing_masks", False)
     poisson_blend_enabled = getattr(modules.globals, "poisson_blend", False)
+    skin_detail_strength = max(0.0, min(1.0, getattr(modules.globals, "skin_detail_strength", 0.0)))
+    many_faces_for_stabilization = getattr(modules.globals, "many_faces", False)
     # Poisson blend's seamlessClone needs the genuine pre-swap frame as its
     # destination. Without this, original_frame aliases temp_frame, which
     # _fast_paste_back mutates in place — so seamlessClone would blend the
-    # swapped face onto the already-swapped frame (no visible effect).
+    # swapped face onto the already-swapped frame (no visible effect). Same
+    # reasoning applies to face_parsing_masks' hair-occlusion pass below,
+    # which can run even when none of the per-region toggles are enabled.
     needs_original = (
         opacity < 1.0 or mouth_mask_enabled or eyes_mask_enabled
-        or beard_mask_enabled or poisson_blend_enabled
+        or beard_mask_enabled or eyebrows_mask_enabled or forehead_mask_enabled
+        or glasses_mask_enabled or poisson_blend_enabled or skin_detail_strength > 0
+        or face_parsing_enabled
     )
     if needs_original:
         original_frame = temp_frame.copy()
@@ -673,6 +826,8 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
             if not isinstance(bgr_fake, np.ndarray):
                 return original_frame
 
+            bgr_fake = _apply_shape_correction(bgr_fake, source_face, target_face)
+
             if use_swap_cache:
                 _SWAP_LIVE_CACHE['bgr_fake'] = bgr_fake
         else:
@@ -698,50 +853,172 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # --- Post-swap Processing (Masking, Opacity, etc.) ---
     # Now, work with the guaranteed uint8 'swapped_frame'
 
-    # Whole-face mask shared by mouth/eyes/beard masking below — computed at
-    # most once per frame regardless of how many of the three are active.
+    # Whole-face mask shared by all preserve-masks below — computed at most
+    # once per frame regardless of how many regions are active.
     face_mask = None
-    if mouth_mask_enabled or eyes_mask_enabled or beard_mask_enabled:
+    if (mouth_mask_enabled or eyes_mask_enabled or beard_mask_enabled
+            or eyebrows_mask_enabled or forehead_mask_enabled or glasses_mask_enabled
+            or skin_detail_strength > 0):
         face_mask = create_face_mask(target_face, original_frame) # Use original_frame for mask creation geometry
 
-    if mouth_mask_enabled: # Check if mouth_mask is enabled
-        # Create the mouth mask using the ORIGINAL frame (before swap) for cutout
-        mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = (
-            create_lower_mouth_mask(target_face, original_frame) # Use original_frame for real mouth cutout
-        )
+    def _region_strength(field: str) -> float:
+        return max(0.0, min(1.0, getattr(modules.globals, field, 1.0)))
 
-        # Apply the mouth area only if mouth_cutout exists
-        if mouth_cutout is not None and mouth_box != (0,0,0,0):
-            # Apply mouth area (from original) onto the 'swapped_frame'
-            swapped_frame = apply_mouth_area(
-                swapped_frame, mouth_cutout, mouth_box, face_mask, lower_lip_polygon
+    # Face-Parsing precision mode: BiSeNet gives pixel-accurate masks for
+    # mouth/eyes/eyebrows/glasses (and hair, for occlusion below) instead of
+    # landmark-geometry approximations. It has no forehead/beard class, so
+    # those two always stay on the landmark path regardless of this toggle.
+    parsed_face = None
+    if face_parsing_enabled and (
+        mouth_mask_enabled or eyes_mask_enabled or eyebrows_mask_enabled or glasses_mask_enabled
+    ):
+        from modules.processors.frame.face_parsing import parse_face
+        parsed_face = parse_face(target_face, original_frame)
+
+    if mouth_mask_enabled: # Check if mouth_mask is enabled
+        if face_parsing_enabled and parsed_face is not None:
+            from modules.processors.frame.face_parsing import region_mask
+            mouth_region = region_mask(parsed_face, swapped_frame.shape, "mouth", "u_lip", "l_lip")
+            swapped_frame = apply_parsing_mask(
+                swapped_frame, original_frame, mouth_region, face_mask,
+                strength=_region_strength("mouth_mask_opacity"),
+            )
+        else:
+            # Create the mouth mask using the ORIGINAL frame (before swap) for cutout
+            mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = (
+                create_lower_mouth_mask(target_face, original_frame) # Use original_frame for real mouth cutout
             )
 
-            # Draw bounding box only while slider is being dragged
-            if getattr(modules.globals, "show_mouth_mask_box", False):
-                mouth_mask_data = (mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon)
-                swapped_frame = draw_mouth_mask_visualization(
-                    swapped_frame, target_face, mouth_mask_data
+            # Apply the mouth area only if mouth_cutout exists
+            if mouth_cutout is not None and mouth_box != (0,0,0,0):
+                if not many_faces_for_stabilization:
+                    lower_lip_polygon = _stabilize_polygon("mouth", lower_lip_polygon)
+                # Apply mouth area (from original) onto the 'swapped_frame'
+                swapped_frame = apply_mouth_area(
+                    swapped_frame, mouth_cutout, mouth_box, face_mask, lower_lip_polygon,
+                    strength=_region_strength("mouth_mask_opacity"),
                 )
 
+                # Draw bounding box only while slider is being dragged
+                if getattr(modules.globals, "show_mouth_mask_box", False):
+                    mouth_mask_data = (mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon)
+                    swapped_frame = draw_mouth_mask_visualization(
+                        swapped_frame, target_face, mouth_mask_data
+                    )
+
     if eyes_mask_enabled:
-        # Keep the target's real eyes instead of the swapped ones, same
-        # paste-back pattern as the mouth mask above.
-        _, eyes_cutout, eyes_box, eyes_polygon = create_eyes_mask(target_face, original_frame)
-        if (eyes_cutout is not None and eyes_box != (0, 0, 0, 0)
-                and eyes_polygon is not None and len(eyes_polygon) >= 3):
-            swapped_frame = apply_mouth_area(
-                swapped_frame, eyes_cutout, eyes_box, face_mask, eyes_polygon
+        if face_parsing_enabled and parsed_face is not None:
+            from modules.processors.frame.face_parsing import region_mask
+            eyes_region = region_mask(parsed_face, swapped_frame.shape, "l_eye", "r_eye")
+            swapped_frame = apply_parsing_mask(
+                swapped_frame, original_frame, eyes_region, face_mask,
+                strength=_region_strength("eyes_mask_opacity"),
             )
+        else:
+            # Keep the target's real eyes instead of the swapped ones, same
+            # paste-back pattern as the mouth mask above.
+            _, eyes_cutout, eyes_box, eyes_polygon = create_eyes_mask(target_face, original_frame)
+            if (eyes_cutout is not None and eyes_box != (0, 0, 0, 0)
+                    and eyes_polygon is not None and len(eyes_polygon) >= 3):
+                if not many_faces_for_stabilization:
+                    eyes_polygon = _stabilize_polygon("eyes", eyes_polygon)
+                swapped_frame = apply_mouth_area(
+                    swapped_frame, eyes_cutout, eyes_box, face_mask, eyes_polygon,
+                    strength=_region_strength("eyes_mask_opacity"),
+                )
 
     if beard_mask_enabled:
         # Keep the target's real beard/jawline instead of the swapped one.
         _, beard_cutout, beard_box, beard_polygon = create_beard_mask(target_face, original_frame)
         if (beard_cutout is not None and beard_box != (0, 0, 0, 0)
                 and beard_polygon is not None and len(beard_polygon) >= 3):
+            if not many_faces_for_stabilization:
+                beard_polygon = _stabilize_polygon("beard", beard_polygon)
             swapped_frame = apply_mouth_area(
-                swapped_frame, beard_cutout, beard_box, face_mask, beard_polygon
+                swapped_frame, beard_cutout, beard_box, face_mask, beard_polygon,
+                strength=_region_strength("beard_mask_opacity"),
             )
+
+    if eyebrows_mask_enabled:
+        if face_parsing_enabled and parsed_face is not None:
+            from modules.processors.frame.face_parsing import region_mask
+            eyebrows_region = region_mask(parsed_face, swapped_frame.shape, "l_brow", "r_brow")
+            swapped_frame = apply_parsing_mask(
+                swapped_frame, original_frame, eyebrows_region, face_mask,
+                strength=_region_strength("eyebrows_mask_opacity"),
+            )
+        else:
+            # Keep the target's real eyebrows instead of the swapped ones.
+            _, eyebrows_cutout, eyebrows_box, eyebrows_polygon = create_eyebrows_mask(target_face, original_frame)
+            if (eyebrows_cutout is not None and eyebrows_box != (0, 0, 0, 0)
+                    and eyebrows_polygon is not None and len(eyebrows_polygon) >= 3):
+                if not many_faces_for_stabilization:
+                    eyebrows_polygon = _stabilize_polygon("eyebrows", eyebrows_polygon)
+                swapped_frame = apply_mouth_area(
+                    swapped_frame, eyebrows_cutout, eyebrows_box, face_mask, eyebrows_polygon,
+                    strength=_region_strength("eyebrows_mask_opacity"),
+                )
+
+    if forehead_mask_enabled:
+        # Keep the target's real forehead/hairline instead of the swapped one.
+        _, forehead_cutout, forehead_box, forehead_polygon = create_forehead_mask(target_face, original_frame)
+        if (forehead_cutout is not None and forehead_box != (0, 0, 0, 0)
+                and forehead_polygon is not None and len(forehead_polygon) >= 3):
+            if not many_faces_for_stabilization:
+                forehead_polygon = _stabilize_polygon("forehead", forehead_polygon)
+            swapped_frame = apply_mouth_area(
+                swapped_frame, forehead_cutout, forehead_box, face_mask, forehead_polygon,
+                strength=_region_strength("forehead_mask_opacity"),
+            )
+
+    if glasses_mask_enabled:
+        if face_parsing_enabled and parsed_face is not None:
+            from modules.processors.frame.face_parsing import region_mask
+            # Exact glasses pixels only — if BiSeNet finds none (no glasses
+            # worn), region_mask is all-zero and apply_parsing_mask no-ops,
+            # so this doubles as automatic glasses detection with no extra
+            # toggle needed.
+            glasses_region = region_mask(parsed_face, swapped_frame.shape, "eye_g")
+            swapped_frame = apply_parsing_mask(
+                swapped_frame, original_frame, glasses_region, face_mask,
+                strength=_region_strength("glasses_mask_opacity"),
+            )
+        else:
+            # Keep the target's real eyeglasses instead of letting the swap erase them.
+            _, glasses_cutout, glasses_box, glasses_polygon = create_glasses_mask(target_face, original_frame)
+            if (glasses_cutout is not None and glasses_box != (0, 0, 0, 0)
+                    and glasses_polygon is not None and len(glasses_polygon) >= 3):
+                if not many_faces_for_stabilization:
+                    glasses_polygon = _stabilize_polygon("glasses", glasses_polygon)
+                swapped_frame = apply_mouth_area(
+                    swapped_frame, glasses_cutout, glasses_box, face_mask, glasses_polygon,
+                    strength=_region_strength("glasses_mask_opacity"),
+                )
+
+    # --- Hair Occlusion (Face-Parsing only) ---
+    # Restores real hair pixels wherever BiSeNet finds them, unconstrained by
+    # the face-oval mask (hair often falls outside it) — so strands crossing
+    # the forehead/face aren't overwritten by the swap. Independent of the
+    # per-region toggles above; only needs face_parsing_masks itself.
+    if face_parsing_enabled:
+        if parsed_face is None:
+            from modules.processors.frame.face_parsing import parse_face
+            parsed_face = parse_face(target_face, original_frame)
+        if parsed_face is not None:
+            from modules.processors.frame.face_parsing import region_mask
+            hair_region = region_mask(parsed_face, swapped_frame.shape, "hair")
+            swapped_frame = apply_parsing_mask(
+                swapped_frame, original_frame, hair_region, face_mask=None, strength=1.0,
+            )
+
+    # --- Frequency-Separation Skin Detail Transfer ---
+    # Runs after the preserve-masks (harmless there — those regions already
+    # hold the target's original pixels, so transferring detail onto them is
+    # a no-op in practice) and before Poisson blending.
+    if skin_detail_strength > 0 and face_mask is not None:
+        swapped_frame = apply_skin_detail_transfer(
+            swapped_frame, original_frame, face_mask, target_face, skin_detail_strength
+        )
 
     # --- Poisson Blending ---
     # Mask derived from the swap's own affine (M) + swapped pixels (bgr_fake),
@@ -1293,7 +1570,7 @@ def create_lower_mouth_mask(
         # constant, which is why the slider had no effect.
         # s: 0.0 (slider ~0, tight lip outline) -> 1.0 (slider 100, mouth->chin).
         mouth_mask_size = getattr(modules.globals, "mouth_mask_size", 0.0) # 0-100 slider
-        s = max(0.0, min(1.0, mouth_mask_size / 100.0))
+        s = max(0.0, min(1.0, mouth_mask_size / 100.0)) * _pose_scale(landmarks)
 
         # Uniformly scaling a simple polygon about its centroid keeps it simple
         # (no self-intersection). x grows with expansion_factor; points below
@@ -1436,6 +1713,7 @@ def apply_mouth_area(
     mouth_box: tuple,
     face_mask: np.ndarray, # Full face mask (for blending edges)
     mouth_polygon: np.ndarray, # Specific polygon for the mouth area itself
+    strength: float = 1.0, # Per-region opacity: 1.0 = fully restore original, 0.0 = no-op
 ) -> np.ndarray:
 
     # Basic validation
@@ -1445,6 +1723,8 @@ def apply_mouth_area(
         return frame
     if (mouth_cutout.size == 0 or face_mask.size == 0 or len(mouth_polygon) < 3):
         # print("Warning: Invalid input (empty array/polygon) to apply_mouth_area") # Optional debug
+        return frame
+    if strength <= 0.0:
         return frame
 
     try: # Wrap main logic in try-except
@@ -1512,6 +1792,13 @@ def apply_mouth_area(
         else:
             feathered_mask.fill(0.0)
 
+        # Scale by the region's opacity — 1.0 behaves exactly as before
+        # (fully restore the original region), lower values partially blend
+        # the swap back in instead of an all-or-nothing toggle.
+        strength = max(0.0, min(1.0, strength))
+        if strength < 1.0:
+            feathered_mask = feathered_mask * strength
+
         # --- Blending: paste original mouth onto swapped face ---
         if len(frame.shape) == 3 and frame.shape[2] == 3:
             mask_3ch = feathered_mask[:, :, np.newaxis].astype(np.float32)
@@ -1528,6 +1815,64 @@ def apply_mouth_area(
         # import traceback
         # traceback.print_exc()
         pass # Don't crash, just return the frame as is
+
+    return frame
+
+
+def apply_parsing_mask(
+    frame: np.ndarray,
+    original_frame: np.ndarray,
+    region_mask_full: np.ndarray,
+    face_mask: Optional[np.ndarray] = None,
+    strength: float = 1.0,
+) -> np.ndarray:
+    """Same paste-back-original blending as apply_mouth_area, but takes a
+    pre-rasterized full-frame binary mask (from BiSeNet face parsing)
+    instead of building a feathered polygon from landmarks.
+
+    face_mask, when given, additionally constrains the restored region to
+    the whole-face convex hull (matching the landmark-based masks' behavior).
+    Pass None to restore wherever region_mask_full says to, unconstrained —
+    used for hair occlusion, since hair often falls outside the face hull.
+    """
+    strength = max(0.0, min(1.0, strength))
+    if strength <= 0.0 or region_mask_full is None or not np.any(region_mask_full):
+        return frame
+
+    try:
+        ys, xs = np.nonzero(region_mask_full)
+        min_y, max_y = int(ys.min()), int(ys.max()) + 1
+        min_x, max_x = int(xs.min()), int(xs.max()) + 1
+
+        pad = max(4, int(max(max_x - min_x, max_y - min_y) * 0.08))
+        fh, fw = frame.shape[:2]
+        min_y, max_y = max(0, min_y - pad), min(fh, max_y + pad)
+        min_x, max_x = max(0, min_x - pad), min(fw, max_x + pad)
+        if max_x <= min_x or max_y <= min_y:
+            return frame
+
+        roi = frame[min_y:max_y, min_x:max_x]
+        original_roi = original_frame[min_y:max_y, min_x:max_x]
+        mask_roi = region_mask_full[min_y:max_y, min_x:max_x]
+
+        feather_amount = max(1, min(25, min(roi.shape[0], roi.shape[1]) // 8))
+        k = 2 * feather_amount + 1
+        feathered = cv2.GaussianBlur(mask_roi.astype(np.float32), (k, k), 0)
+        max_val = feathered.max()
+        if max_val > 1e-6:
+            feathered = feathered / max_val
+        feathered = feathered * strength
+
+        if face_mask is not None:
+            face_mask_roi = face_mask[min_y:max_y, min_x:max_x].astype(np.float32) / 255.0
+            feathered = feathered * face_mask_roi
+
+        mask_3ch = feathered[:, :, np.newaxis]
+        blended = (original_roi.astype(np.float32) * mask_3ch +
+                   roi.astype(np.float32) * (1.0 - mask_3ch))
+        frame[min_y:max_y, min_x:max_x] = np.clip(blended, 0, 255).astype(np.uint8)
+    except Exception as e:
+        print(f"Error in apply_parsing_mask: {e}")
 
     return frame
 
@@ -1612,6 +1957,22 @@ def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
         blur_k_size = max(1, blur_k_size // 2 * 2 + 1) # Ensure odd and positive
         mask = gpu_gaussian_blur(mask, (blur_k_size, blur_k_size), 0)
 
+        # Hairline Feather — extra softening confined to the top band of the
+        # mask (near the hairline), fading linearly back to the normal blur
+        # by ~35% down the frame so it doesn't soften the rest of the face.
+        hairline_feather = max(0.0, getattr(modules.globals, "hairline_feather", 0.0))
+        if hairline_feather > 0:
+            soft_k = int(hairline_feather) * 2 + 1
+            soft_mask = gpu_gaussian_blur(mask, (soft_k, soft_k), hairline_feather)
+            top_band = max(1, int(mask.shape[0] * 0.35))
+            fade = np.linspace(1.0, 0.0, top_band, dtype=np.float32).reshape(-1, 1)
+            blended_top = (
+                soft_mask[:top_band].astype(np.float32) * fade
+                + mask[:top_band].astype(np.float32) * (1.0 - fade)
+            )
+            mask = mask.copy()
+            mask[:top_band] = blended_top.astype(np.uint8)
+
         # --- Optional: Return float mask for apply_mouth_area ---
         # mask = mask.astype(float) / 255.0
         # ---
@@ -1656,7 +2017,7 @@ def create_beard_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tupl
         mouth = landmarks[52:64].astype(np.float32)
         mouth_center_y = float(np.mean(mouth[:, 1]))
 
-        size = max(0.0, min(2.0, getattr(modules.globals, "beard_mask_size", 1.0)))
+        size = max(0.0, min(2.0, getattr(modules.globals, "beard_mask_size", 1.0))) * _pose_scale(landmarks)
         # Small upward margin above the mouth line so the mask doesn't
         # immediately butt up against the (separately toggle-able) mouth mask.
         cutoff_y = mouth_center_y - 6.0 * size
@@ -1698,6 +2059,169 @@ def create_beard_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tupl
         print(f"Error creating beard mask: {e}")
 
     return mask, beard_cutout, beard_box, beard_polygon
+
+
+def create_forehead_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
+    """Creates a mask covering the forehead/hairline area (above the eyebrows),
+    so the target's real forehead/hairline can be pasted back over the swap.
+
+    Mirrors create_beard_mask's approach (verified jaw/mouth landmark indices,
+    convex-hull-based single polygon) but extends upward from the brow line
+    using the same forehead-estimation technique as create_face_mask, instead
+    of clipping the jaw at the mouth line.
+    """
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    forehead_cutout = None
+    forehead_polygon = None
+    forehead_box = (0, 0, 0, 0)
+
+    landmarks = getattr(face, "landmark_2d_106", None)
+    if landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape[0] < 106:
+        return mask, forehead_cutout, forehead_box, forehead_polygon
+
+    try:
+        if not np.all(np.isfinite(landmarks)):
+            return mask, forehead_cutout, forehead_box, forehead_polygon
+
+        eyebrows = landmarks[33:43].astype(np.float32)
+        chin = landmarks[16].astype(np.float32)
+        # Temple points from the jaw outline (near ear/eye level) widen the sides.
+        temples = landmarks[[0, 32]].astype(np.float32)
+
+        eyebrow_center = np.mean(eyebrows, axis=0)
+        up_vector = eyebrow_center - chin
+        norm = np.linalg.norm(up_vector)
+        if norm <= 0:
+            return mask, forehead_cutout, forehead_box, forehead_polygon
+        up_vector = up_vector / norm
+
+        size = max(0.0, min(2.0, getattr(modules.globals, "forehead_mask_size", 1.0))) * _pose_scale(landmarks)
+        forehead_offset = up_vector * (norm * (0.9 + 0.6 * size))
+        top_points = eyebrows + forehead_offset
+
+        # Widen the top edge outward slightly for corner coverage.
+        top_center = np.mean(top_points, axis=0)
+        top_points = (top_points - top_center) * 1.2 + top_center
+
+        hull_source = np.vstack([eyebrows, top_points, temples]).astype(np.float32)
+        if not np.all(np.isfinite(hull_source)):
+            return mask, forehead_cutout, forehead_box, forehead_polygon
+
+        hull = cv2.convexHull(hull_source)
+        if hull is None or len(hull) < 3:
+            return mask, forehead_cutout, forehead_box, forehead_polygon
+
+        polygon = hull.reshape(-1, 2).astype(np.int32)
+        min_x, min_y = np.min(polygon, axis=0)
+        max_x, max_y = np.max(polygon, axis=0)
+
+        pad = int(max(max_x - min_x, max_y - min_y) * 0.05)
+        frame_h, frame_w = frame.shape[:2]
+        min_x = max(0, min_x - pad)
+        min_y = max(0, min_y - pad)
+        max_x = min(frame_w, max_x + pad)
+        max_y = min(frame_h, max_y + pad)
+
+        if max_x <= min_x or max_y <= min_y:
+            return mask, forehead_cutout, forehead_box, forehead_polygon
+
+        roi_h, roi_w = max_y - min_y, max_x - min_x
+        mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        poly_rel = polygon - [min_x, min_y]
+        cv2.fillConvexPoly(mask_roi, poly_rel, 255)
+        mask_roi = gpu_gaussian_blur(mask_roi, (21, 21), 8)
+
+        mask[min_y:max_y, min_x:max_x] = mask_roi
+        forehead_cutout = frame[min_y:max_y, min_x:max_x].copy()
+        forehead_polygon = polygon
+        forehead_box = (int(min_x), int(min_y), int(max_x), int(max_y))
+
+    except IndexError:
+        pass
+    except Exception as e:
+        print(f"Error creating forehead mask: {e}")
+
+    return mask, forehead_cutout, forehead_box, forehead_polygon
+
+
+def create_glasses_mask(face: Face, frame: Frame) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
+    """Creates a mask covering the eye+brow band, wide enough to include a
+    typical eyeglass frame/temples, so the target's real glasses can be
+    pasted back over the swap instead of being erased by it.
+
+    Built from the same verified eye/eyebrow landmark ranges as
+    create_eyes_mask / face_masking.create_eyebrows_mask, combined into one
+    convex-hull polygon (rather than two separate ellipses) so a single
+    fillConvexPoly call covers both eyes plus the bridge between them —
+    where glasses frames actually sit.
+    """
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    glasses_cutout = None
+    glasses_polygon = None
+    glasses_box = (0, 0, 0, 0)
+
+    landmarks = getattr(face, "landmark_2d_106", None)
+    if landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape[0] < 106:
+        return mask, glasses_cutout, glasses_box, glasses_polygon
+
+    try:
+        if not np.all(np.isfinite(landmarks)):
+            return mask, glasses_cutout, glasses_box, glasses_polygon
+
+        # Eyes (33-42, 87-96) + eyebrows (43-51, 97-105) + temple points (0, 32).
+        region_idx = (list(range(33, 43)) + list(range(87, 97))
+                      + list(range(43, 51)) + list(range(97, 105)))
+        region_idx = [i for i in region_idx if i < landmarks.shape[0]]
+        if len(region_idx) < 3:
+            return mask, glasses_cutout, glasses_box, glasses_polygon
+        points = landmarks[region_idx].astype(np.float32)
+        temples = landmarks[[0, 32]].astype(np.float32)
+
+        size = max(0.0, min(2.0, getattr(modules.globals, "glasses_mask_size", 1.0))) * _pose_scale(landmarks)
+        center = np.mean(points, axis=0)
+
+        # Widen toward the temples/expand a bit vertically to cover frame height.
+        widened = (points - center) * (1.0 + 0.35 * size) + center
+        hull_source = np.vstack([widened, temples]).astype(np.float32)
+
+        if not np.all(np.isfinite(hull_source)):
+            return mask, glasses_cutout, glasses_box, glasses_polygon
+
+        hull = cv2.convexHull(hull_source)
+        if hull is None or len(hull) < 3:
+            return mask, glasses_cutout, glasses_box, glasses_polygon
+
+        polygon = hull.reshape(-1, 2).astype(np.int32)
+        min_x, min_y = np.min(polygon, axis=0)
+        max_x, max_y = np.max(polygon, axis=0)
+
+        pad = int(max(max_x - min_x, max_y - min_y) * 0.08)
+        frame_h, frame_w = frame.shape[:2]
+        min_x = max(0, min_x - pad)
+        min_y = max(0, min_y - pad)
+        max_x = min(frame_w, max_x + pad)
+        max_y = min(frame_h, max_y + pad)
+
+        if max_x <= min_x or max_y <= min_y:
+            return mask, glasses_cutout, glasses_box, glasses_polygon
+
+        roi_h, roi_w = max_y - min_y, max_x - min_x
+        mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        poly_rel = polygon - [min_x, min_y]
+        cv2.fillConvexPoly(mask_roi, poly_rel, 255)
+        mask_roi = gpu_gaussian_blur(mask_roi, (21, 21), 8)
+
+        mask[min_y:max_y, min_x:max_x] = mask_roi
+        glasses_cutout = frame[min_y:max_y, min_x:max_x].copy()
+        glasses_polygon = polygon
+        glasses_box = (int(min_x), int(min_y), int(max_x), int(max_y))
+
+    except IndexError:
+        pass
+    except Exception as e:
+        print(f"Error creating glasses mask: {e}")
+
+    return mask, glasses_cutout, glasses_box, glasses_polygon
 
 
 def apply_color_transfer(source, target):
